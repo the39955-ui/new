@@ -60,29 +60,8 @@ def init_state():
     ss = st.session_state
     ss.setdefault("api_key", os.environ.get("GEMINI_API_KEY", ""))
     ss.setdefault("models", DEFAULT_MODELS)
-    ss.setdefault(
-        "characters",
-        [
-            new_character(
-                name="Moo-Moo",
-                description="Friendly cartoon cow, black and white patches, pink snout, "
-                "straw hat, big brown eyes, Pixar-style stylised 3D.",
-            )
-        ],
-    )
-    ss.setdefault(
-        "segments",
-        [
-            new_segment(
-                start=0.0,
-                end=6.0,
-                title="HOOK",
-                description="Extreme close-up of Moo-Moo's nose on a sunny farm.",
-                motion="Tongue licks the lens.",
-                camera="Static extreme close-up, camera wobbles on the lick.",
-            )
-        ],
-    )
+    ss.setdefault("characters", [new_character()])
+    ss.setdefault("segments", [new_segment()])
     ss.setdefault("results", {})
     ss.setdefault("final_prompt", "")
 
