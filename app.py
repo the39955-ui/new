@@ -1,9 +1,10 @@
 """
-3D Animation Prompt & Workflow Generator
-Gemini (multimodal) -> structured Blender scene prompts -> paste into Claude (Blender MCP)
+Storyboard -> Blender Prompt Generator
+Upload a storyboard image. Gemini reads it, extracts characters / segments / timing,
+then generates Blender-ready specs you paste into Claude (Blender MCP).
 
 Run:
-    pip install streamlit google-genai
+    pip install -r requirements.txt
     streamlit run app.py
 """
 
@@ -11,13 +12,12 @@ import json
 import os
 import re
 import time
-import uuid
 
 import streamlit as st
 from google import genai
 from google.genai import types
 
-st.set_page_config(page_title="Blender Prompt Generator", page_icon="🎬", layout="wide")
+st.set_page_config(page_title="Storyboard → Blender Prompts", page_icon="🎬", layout="wide")
 
 DEFAULT_MODELS = [
     "gemini-3.1-pro-preview",
@@ -28,60 +28,22 @@ DEFAULT_MODELS = [
     "gemini-2.5-flash",
 ]
 
-# --------------------------------------------------------------------------- #
-# Session state helpers
-# --------------------------------------------------------------------------- #
-def new_segment(**kw):
-    base = {
-        "id": uuid.uuid4().hex[:8],
-        "start": 0.0,
-        "end": 6.0,
-        "title": "",
-        "description": "",
-        "motion": "",
-        "camera": "",
-    }
-    base.update(kw)
-    return base
-
-
-def new_character(**kw):
-    base = {
-        "id": uuid.uuid4().hex[:8],
-        "name": "",
-        "description": "",
-        "asset_source": "",
-    }
-    base.update(kw)
-    return base
-
-
-def init_state():
-    ss = st.session_state
-    ss.setdefault("api_key", os.environ.get("GEMINI_API_KEY", ""))
-    ss.setdefault("models", DEFAULT_MODELS)
-    ss.setdefault("characters", [new_character()])
-    ss.setdefault("segments", [new_segment()])
-    ss.setdefault("results", {})
-    ss.setdefault("final_prompt", "")
-
-
-init_state()
 ss = st.session_state
+ss.setdefault("api_key", os.environ.get("GEMINI_API_KEY", ""))
+ss.setdefault("models", DEFAULT_MODELS)
+ss.setdefault("analysis", None)
+ss.setdefault("results", [])
+ss.setdefault("final_prompt", "")
 
 # --------------------------------------------------------------------------- #
-# Sidebar: API key + model
+# Sidebar
 # --------------------------------------------------------------------------- #
 with st.sidebar:
-    st.header("🔑 Gemini setup")
-
+    st.header("🔑 Gemini API key")
     key_input = st.text_input(
         "API key",
-        value="",
         type="password",
-        placeholder="Paste key, then press Save"
-        if not ss.api_key
-        else "Key saved (hidden). Paste to replace.",
+        placeholder="Key saved (hidden). Paste to replace." if ss.api_key else "Paste key, then Save",
     )
     c1, c2 = st.columns(2)
     if c1.button("Save key", use_container_width=True):
@@ -92,139 +54,86 @@ with st.sidebar:
             st.warning("Enter a key first.")
     if c2.button("Clear key", use_container_width=True):
         ss.api_key = ""
-        st.info("Key removed.")
-    st.caption(
-        "✅ Key stored in session memory only."
-        if ss.api_key
-        else "No key yet. You can also set the GEMINI_API_KEY env variable."
-    )
+    st.caption("✅ Key kept in session memory only." if ss.api_key else "No key saved yet.")
 
     st.divider()
     st.header("🧠 Model")
-
-    def refresh_models():
+    if st.button("↻ Refresh model list from API", use_container_width=True, disabled=not ss.api_key):
         try:
             client = genai.Client(api_key=ss.api_key)
-            found = []
-            for m in client.models.list():
-                actions = getattr(m, "supported_actions", None) or []
-                if "generateContent" in actions and "gemini" in m.name:
-                    found.append(m.name.replace("models/", ""))
+            found = [
+                m.name.replace("models/", "")
+                for m in client.models.list()
+                if "generateContent" in (getattr(m, "supported_actions", None) or [])
+                and "gemini" in m.name
+            ]
             if found:
                 ss.models = sorted(set(found), reverse=True)
                 st.success(f"Loaded {len(found)} models.")
             else:
                 st.warning("No models returned.")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             st.error(f"Could not fetch models: {e}")
-
-    if st.button("↻ Refresh model list from API", use_container_width=True, disabled=not ss.api_key):
-        refresh_models()
-
-    model = st.selectbox("Gemini multimodal model", ss.models, index=0)
+    model = st.selectbox("Gemini multimodal model", ss.models)
     temperature = st.slider("Temperature", 0.0, 1.5, 0.4, 0.1)
 
     st.divider()
-    st.header("🎞️ Scene settings")
+    st.header("⚙️ Optional overrides")
     fps = st.number_input("Frame rate (fps)", 12, 60, 24)
-    style = st.text_input("Visual style", "Stylised Pixar-like 3D cartoon, bright, soft lighting")
     render_engine = st.selectbox("Render engine", ["EEVEE", "Cycles"])
 
 # --------------------------------------------------------------------------- #
-# Main layout
+# Prompts
 # --------------------------------------------------------------------------- #
-st.title("🎬 3D Animation Prompt Generator")
-st.caption("Describe scenes → Gemini structures them → copy into Claude to build the Blender script.")
+ANALYZE_SYSTEM = """You read animation storyboards and extract every detail needed to build the scene in 3D.
+Read ALL text and visuals in the image(s): title, panel numbers, timecodes, panel titles, captions, characters,
+outfits, props, environment, lighting, camera angles and actions. Infer anything not written from the visuals.
+Convert timecodes like "0:35 – 0:55" to seconds. Return ONLY valid JSON."""
 
-# ---- Characters ---------------------------------------------------------- #
-st.subheader("1 · Characters")
-char_files = {}
-for i, ch in enumerate(ss.characters):
-    with st.expander(f"Character: {ch['name'] or 'Unnamed'}", expanded=(i == 0)):
-        a, b = st.columns([2, 3])
-        ch["name"] = a.text_input("Name", ch["name"], key=f"cn_{ch['id']}")
-        ch["asset_source"] = a.text_input(
-            "Existing asset (optional)",
-            ch["asset_source"],
-            key=f"ca_{ch['id']}",
-            help="File path (.blend/.glb/.fbx), Sketchfab/Poly Haven link, or 'generate from image'.",
-        )
-        ch["description"] = b.text_area(
-            "Look & personality", ch["description"], key=f"cd_{ch['id']}", height=110
-        )
-        char_files[ch["id"]] = st.file_uploader(
-            "Reference images (turnaround, concept art)",
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=True,
-            key=f"cf_{ch['id']}",
-        )
-        if len(ss.characters) > 1 and st.button("Remove character", key=f"cr_{ch['id']}"):
-            ss.characters.remove(ch)
-            st.rerun()
-if st.button("＋ Add character"):
-    ss.characters.append(new_character())
-    st.rerun()
+ANALYZE_SCHEMA = """{
+  "project_title": str,
+  "visual_style": str,
+  "overall_environment": str,
+  "total_duration_s": number,
+  "characters": [{
+    "name": str,
+    "species_or_type": str,
+    "appearance": str,
+    "outfit_and_accessories": str,
+    "colors": str,
+    "approx_height_m": number,
+    "personality": str
+  }],
+  "segments": [{
+    "number": int,
+    "title": str,
+    "start_s": number,
+    "end_s": number,
+    "caption_text": str,
+    "visual_description": str,
+    "characters_present": [str],
+    "actions": [str],
+    "camera": str,
+    "props_and_effects": [str],
+    "mood_and_lighting": str
+  }]
+}"""
 
-st.text_area(
-    "Global environment notes (optional)",
-    key="env_notes",
-    placeholder="e.g. Sunny farm, wooden fence, hay bales, blue sky with soft clouds.",
-    height=80,
-)
-
-# ---- Segments ------------------------------------------------------------ #
-st.subheader("2 · Scene segments")
-seg_files = {}
-for i, sg in enumerate(ss.segments):
-    label = f"Segment {i + 1} · {sg['title'] or 'Untitled'} ({sg['start']:.1f}s–{sg['end']:.1f}s)"
-    with st.expander(label, expanded=(i == 0)):
-        t1, t2, t3 = st.columns([1, 1, 3])
-        sg["start"] = t1.number_input("Start (s)", 0.0, 3600.0, float(sg["start"]), 0.5, key=f"ss_{sg['id']}")
-        sg["end"] = t2.number_input("End (s)", 0.0, 3600.0, float(sg["end"]), 0.5, key=f"se_{sg['id']}")
-        sg["title"] = t3.text_input("Title", sg["title"], key=f"st_{sg['id']}", placeholder="HOOK, REVEAL, CTA…")
-
-        d1, d2 = st.columns(2)
-        sg["description"] = d1.text_area(
-            "Scene description", sg["description"], key=f"sd_{sg['id']}", height=110
-        )
-        sg["motion"] = d2.text_area(
-            "Motion / action details", sg["motion"], key=f"sm_{sg['id']}", height=110
-        )
-        sg["camera"] = st.text_input("Camera notes", sg["camera"], key=f"sc_{sg['id']}")
-        seg_files[sg["id"]] = st.file_uploader(
-            "Storyboard panel / reference images (optional)",
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=True,
-            key=f"sf_{sg['id']}",
-        )
-        if len(ss.segments) > 1 and st.button("Remove segment", key=f"sr_{sg['id']}"):
-            ss.segments.remove(sg)
-            st.rerun()
-
-if st.button("＋ Add segment"):
-    last_end = ss.segments[-1]["end"] if ss.segments else 0.0
-    ss.segments.append(new_segment(start=last_end, end=last_end + 6.0))
-    st.rerun()
-
-# --------------------------------------------------------------------------- #
-# Gemini generation
-# --------------------------------------------------------------------------- #
-SYSTEM_PROMPT = """You are a technical director who converts animation storyboards into precise,
-Blender-ready scene specifications. Another AI (Claude, using a Blender MCP connector) will read your
-output and write a Blender Python (bpy) script, so be concrete and unambiguous.
+GENERATE_SYSTEM = """You are a technical director who converts storyboard segments into precise, Blender-ready
+scene specifications. Another AI (Claude, using a Blender MCP connector) will read your output and write a
+Blender Python (bpy) script, so be concrete and unambiguous.
 
 Rules:
 - Blender conventions: right-handed, Z-up, metres, rotations in degrees (Euler XYZ), camera looks down its local -Z.
-- Every character must include import instructions (how to obtain/import the asset) AND exact placement
+- Every character needs import instructions (how to obtain/import the asset) AND exact placement
   (location, rotation, scale) plus a starting pose.
-- Use the reference images (if any) to infer proportions, colours, materials, props and framing.
+- Fill in every detail the storyboard leaves out (positions, distances, lens, easing, timing) with sensible values.
 - Times are in seconds from the start of the whole animation; also give frame numbers at the stated fps.
-- Keep animation as keyframe lists with explicit values; avoid vague words like "somewhat".
+- Animation is a list of keyframes with explicit values; avoid vague words.
 - Maintain continuity with the previous segment's end state when provided.
-- Do not invent characters not listed, unless they are clearly visible in a storyboard image.
 - Return ONLY valid JSON, no markdown fences."""
 
-SCHEMA_HINT = """{
+GENERATE_SCHEMA = """{
   "segment_title": str,
   "time_range": {"start_s": number, "end_s": number, "start_frame": int, "end_frame": int},
   "summary": str,
@@ -243,182 +152,210 @@ SCHEMA_HINT = """{
   "end_state": str
 }"""
 
-
-def load_parts(files):
-    parts = []
-    for f in files or []:
-        parts.append(types.Part.from_bytes(data=f.getvalue(), mime_type=f.type or "image/png"))
-    return parts
-
-
-def strip_fences(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return text
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def to_parts(files):
+    return [
+        types.Part.from_bytes(data=f.getvalue(), mime_type=f.type or "image/png")
+        for f in files or []
+    ]
 
 
-def call_gemini(client, contents):
+def parse_json(text):
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+    return json.loads(text)
+
+
+def call_gemini(client, system, contents):
     cfg = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=system,
         temperature=temperature,
         response_mime_type="application/json",
     )
-    last_err = None
+    err = None
     for attempt in range(3):
         try:
-            resp = client.models.generate_content(model=model, contents=contents, config=cfg)
-            return resp.text
+            return client.models.generate_content(model=model, contents=contents, config=cfg).text
         except Exception as e:  # noqa: BLE001
-            last_err = e
+            err = e
             time.sleep(2 * (attempt + 1))
-    raise last_err
+    raise err
 
 
-def generate_all():
+def run_pipeline(story_files, ref_files, notes):
     client = genai.Client(api_key=ss.api_key)
-    ss.results = {}
-    prev_end_state = ""
-    progress = st.progress(0.0, text="Starting…")
-    total = len(ss.segments)
+    story_parts = to_parts(story_files)
+    ref_parts = to_parts(ref_files)
+    notes_txt = f"\nExtra notes from the user: {notes}" if notes.strip() else ""
 
-    char_block = "\n".join(
-        f"- {c['name'] or 'Unnamed'}: {c['description']} | asset: {c['asset_source'] or 'none provided'}"
-        for c in ss.characters
+    # ---- Stage 1: read the storyboard ------------------------------------ #
+    status = st.status("Reading storyboard…", expanded=True)
+    contents = ["Storyboard image(s):", *story_parts]
+    if ref_parts:
+        contents += ["Extra character/environment reference images:", *ref_parts]
+    contents.append(f"Extract everything into this JSON shape:\n{ANALYZE_SCHEMA}{notes_txt}")
+    raw = call_gemini(client, ANALYZE_SYSTEM, contents)
+    try:
+        analysis = parse_json(raw)
+    except json.JSONDecodeError:
+        status.update(label="Could not parse the storyboard analysis", state="error")
+        st.code(raw)
+        return
+    ss.analysis = analysis
+    segments = analysis.get("segments", [])
+    status.write(
+        f"Found {len(analysis.get('characters', []))} characters and {len(segments)} segments."
     )
 
-    for idx, sg in enumerate(ss.segments):
-        progress.progress(idx / total, text=f"Segment {idx + 1}/{total}: {sg['title'] or 'Untitled'}")
-        contents = []
-
-        # character reference images first
-        for c in ss.characters:
-            imgs = load_parts(char_files.get(c["id"]))
-            if imgs:
-                contents.append(f"Reference images for character '{c['name']}':")
-                contents.extend(imgs)
-        seg_imgs = load_parts(seg_files.get(sg["id"]))
-        if seg_imgs:
-            contents.append("Storyboard / reference images for THIS segment:")
-            contents.extend(seg_imgs)
-
+    # ---- Stage 2: one Blender spec per segment --------------------------- #
+    ss.results = []
+    prev_end = ""
+    progress = st.progress(0.0)
+    for i, seg in enumerate(segments):
+        status.write(f"Generating segment {i + 1}/{len(segments)}: {seg.get('title', '')}")
+        contents = ["Storyboard image(s):", *story_parts]
+        if ref_parts:
+            contents += ["Extra reference images:", *ref_parts]
         contents.append(
-            f"""Global settings:
-- FPS: {fps}
-- Visual style: {style}
-- Render engine: {render_engine}
-- Environment notes: {st.session_state.get('env_notes', '') or 'none'}
+            f"""Project: {analysis.get('project_title', '')}
+Visual style: {analysis.get('visual_style', '')}
+Overall environment: {analysis.get('overall_environment', '')}
+FPS: {fps} | Render engine: {render_engine}
 
 Characters:
-{char_block}
+{json.dumps(analysis.get('characters', []), indent=2)}
 
-Segment {idx + 1} of {total}
-- Title: {sg['title']}
-- Time: {sg['start']}s to {sg['end']}s
-- Scene description: {sg['description']}
-- Motion details: {sg['motion']}
-- Camera notes: {sg['camera']}
+Segment to build now ({i + 1} of {len(segments)}):
+{json.dumps(seg, indent=2)}
 
-Previous segment end state: {prev_end_state or 'n/a (first segment)'}
+Previous segment end state: {prev_end or 'n/a (first segment)'}{notes_txt}
 
 Return JSON matching this shape exactly:
-{SCHEMA_HINT}"""
+{GENERATE_SCHEMA}"""
         )
-
-        raw = call_gemini(client, contents)
+        raw = call_gemini(client, GENERATE_SYSTEM, contents)
         try:
-            data = json.loads(strip_fences(raw))
-            prev_end_state = data.get("end_state", "") if isinstance(data, dict) else ""
+            data = parse_json(raw)
+            prev_end = data.get("end_state", "") if isinstance(data, dict) else ""
         except json.JSONDecodeError:
             data = {"_raw": raw, "_error": "Model did not return valid JSON"}
-        ss.results[sg["id"]] = data
+        ss.results.append((seg, data))
+        progress.progress((i + 1) / len(segments))
 
-    progress.progress(1.0, text="Done")
+    status.update(label="Done", state="complete", expanded=False)
     build_final_prompt()
 
 
 def build_final_prompt():
-    lines = []
-    lines.append("# TASK: Build a Blender animation via the Blender MCP connector\n")
-    lines.append(
+    a = ss.analysis or {}
+    L = ["# TASK: Build a Blender animation via the Blender MCP connector\n"]
+    L.append(
         "Using the Blender connector, write and execute a Python (bpy) script that builds the scene "
         "below. Work segment by segment so I can review each one.\n"
     )
-    lines.append("## Requirements")
-    lines.append(f"- FPS: {fps}  |  Render engine: {render_engine}")
-    lines.append("- Units: metres, Z-up. Rotations are in degrees (Euler XYZ).")
-    lines.append(f"- Style: {style}")
-    lines.append(
+    L.append("## Requirements")
+    L.append(f"- FPS: {fps}  |  Render engine: {render_engine}")
+    L.append("- Units: metres, Z-up. Rotations are in degrees (Euler XYZ).")
+    if a.get("visual_style"):
+        L.append(f"- Style: {a['visual_style']}")
+    L.append(
         "- Import each character using its `import_strategy` (local file, Sketchfab, Poly Haven, "
-        "Hyper3D/Hunyuan3D, or a primitive stand-in if unavailable) and apply the exact placement.")
-    lines.append("- Use keyframes (`keyframe_insert`) with the times/frames given; set scene frame range to cover all segments.")
-    lines.append("- Name every object clearly so later segments can reference them.")
-    lines.append("- After each segment, report what was created and any assumptions or fallbacks.\n")
+        "Hyper3D/Hunyuan3D, or a primitive stand-in if unavailable) and apply the exact placement."
+    )
+    L.append("- Use keyframes (`keyframe_insert`) with the times/frames given; set the scene frame range to cover all segments.")
+    L.append("- Name every object clearly so later segments can reference them.")
+    L.append("- After each segment, report what was created and any assumptions or fallbacks.\n")
 
-    lines.append("## Characters")
-    for c in ss.characters:
-        lines.append(f"- **{c['name'] or 'Unnamed'}**: {c['description']}")
-        if c["asset_source"]:
-            lines.append(f"  - Asset: {c['asset_source']}")
-    if st.session_state.get("env_notes"):
-        lines.append(f"\n## Global environment\n{st.session_state['env_notes']}")
+    if a.get("project_title"):
+        L.append(f"## Project: {a['project_title']}")
+    if a.get("overall_environment"):
+        L.append(f"Environment: {a['overall_environment']}\n")
 
-    lines.append("\n## Segments")
-    for i, sg in enumerate(ss.segments, 1):
-        data = ss.results.get(sg["id"])
-        if not data:
+    L.append("## Characters")
+    for c in a.get("characters", []):
+        L.append(f"- **{c.get('name', 'Unnamed')}** ({c.get('species_or_type', '')}): {c.get('appearance', '')}")
+        if c.get("outfit_and_accessories"):
+            L.append(f"  - Outfit: {c['outfit_and_accessories']}")
+        if c.get("colors"):
+            L.append(f"  - Colors: {c['colors']}")
+        if c.get("approx_height_m"):
+            L.append(f"  - Approx height: {c['approx_height_m']} m")
+
+    L.append("\n## Segments")
+    for i, (seg, data) in enumerate(ss.results, 1):
+        L.append(f"\n### Segment {i}: {seg.get('title', 'Untitled')} ({seg.get('start_s')}s–{seg.get('end_s')}s)")
+        if "_raw" in data:
+            L.append(data["_raw"])
             continue
-        lines.append(f"\n### Segment {i}: {sg['title'] or 'Untitled'} ({sg['start']}s–{sg['end']}s)")
-        if isinstance(data, dict) and "_raw" in data:
-            lines.append(data["_raw"])
-        else:
-            if data.get("summary"):
-                lines.append(data["summary"])
-            if data.get("claude_instructions"):
-                lines.append(f"\n**Instructions:** {data['claude_instructions']}")
-            lines.append("\n```json")
-            lines.append(json.dumps(data, indent=2, ensure_ascii=False))
-            lines.append("```")
+        if data.get("summary"):
+            L.append(data["summary"])
+        if data.get("claude_instructions"):
+            L.append(f"\n**Instructions:** {data['claude_instructions']}")
+        L.append("\n```json")
+        L.append(json.dumps(data, indent=2, ensure_ascii=False))
+        L.append("```")
 
-    lines.append("\n## Deliverable")
-    lines.append(
+    L.append("\n## Deliverable")
+    L.append(
         "Start with Segment 1: generate the bpy script, execute it through the Blender connector, "
         "and confirm the result before continuing."
     )
-    ss.final_prompt = "\n".join(lines)
+    ss.final_prompt = "\n".join(L)
 
 
-st.subheader("3 · Generate")
-ready = bool(ss.api_key) and any(s["description"].strip() or s["motion"].strip() for s in ss.segments)
+# --------------------------------------------------------------------------- #
+# Main UI
+# --------------------------------------------------------------------------- #
+st.title("🎬 Storyboard → Blender Prompts")
+st.caption("Upload your storyboard. Gemini reads it and generates everything else.")
+
+story_files = st.file_uploader(
+    "1 · Storyboard image(s)",
+    type=["png", "jpg", "jpeg", "webp"],
+    accept_multiple_files=True,
+)
+if story_files:
+    st.image([f.getvalue() for f in story_files], width=420)
+
+with st.expander("Optional: extra references and notes"):
+    ref_files = st.file_uploader(
+        "Character / environment reference images",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key="refs",
+    )
+    notes = st.text_area("Extra notes for the model", placeholder="Anything the storyboard doesn't show.")
+
 if not ss.api_key:
-    st.info("Add and save your Gemini API key in the sidebar.")
+    st.info("Save your Gemini API key in the sidebar first.")
 
-if st.button("✨ Generate Blender prompts", type="primary", disabled=not ready):
+if st.button("✨ Analyze & generate", type="primary", disabled=not (ss.api_key and story_files)):
     try:
-        generate_all()
-        st.success("Prompts generated.")
+        run_pipeline(story_files, ref_files, notes)
     except Exception as e:  # noqa: BLE001
         st.error(f"Generation failed: {e}")
 
 # --------------------------------------------------------------------------- #
 # Output
 # --------------------------------------------------------------------------- #
+if ss.analysis:
+    with st.expander("What Gemini read from the storyboard", expanded=False):
+        st.json(ss.analysis, expanded=1)
+
 if ss.results:
-    st.subheader("4 · Review")
-    for i, sg in enumerate(ss.segments, 1):
-        data = ss.results.get(sg["id"])
-        if data is None:
-            continue
-        with st.expander(f"Segment {i}: {sg['title'] or 'Untitled'}", expanded=False):
-            if isinstance(data, dict) and "_raw" in data:
+    with st.expander("Per-segment Blender specs", expanded=False):
+        for i, (seg, data) in enumerate(ss.results, 1):
+            st.markdown(f"**Segment {i}: {seg.get('title', '')}**")
+            if "_raw" in data:
                 st.warning(data["_error"])
                 st.code(data["_raw"])
             else:
-                st.json(data, expanded=1)
+                st.json(data, expanded=False)
 
 if ss.final_prompt:
-    st.subheader("5 · Copy into Claude")
-    st.caption("Use the copy icon at the top-right of the block, or download as a file.")
+    st.subheader("2 · Copy into Claude")
+    st.caption("Use the copy icon at the top-right of the block, or download the file.")
     st.code(ss.final_prompt, language="markdown", wrap_lines=True)
     st.download_button(
         "⬇️ Download as .md",
@@ -426,8 +363,3 @@ if ss.final_prompt:
         file_name="blender_prompt_for_claude.md",
         mime="text/markdown",
     )
-    with st.expander("Edit before copying"):
-        edited = st.text_area("Final prompt", ss.final_prompt, height=400)
-        if st.button("Apply edits"):
-            ss.final_prompt = edited
-            st.rerun()
