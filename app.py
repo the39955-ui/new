@@ -34,6 +34,7 @@ ss.setdefault("models", DEFAULT_MODELS)
 ss.setdefault("analysis", None)
 ss.setdefault("results", [])
 ss.setdefault("final_prompt", "")
+ss.setdefault("segment_prompts", [])
 
 # --------------------------------------------------------------------------- #
 # Sidebar
@@ -183,6 +184,19 @@ def call_gemini(client, system, contents):
     raise err
 
 
+def generate_json(client, system, contents, tries=3):
+    """Call Gemini and return (parsed_json, raw_text). Retries if JSON is invalid."""
+    raw = ""
+    for _ in range(tries):
+        raw = call_gemini(client, system, contents)
+        try:
+            return parse_json(raw), raw
+        except json.JSONDecodeError:
+            contents = [*contents, "Your previous reply was not valid JSON. Return ONLY strict JSON: "
+                        "double-quoted keys, no comments, no trailing commas, no extra keys."]
+    return None, raw
+
+
 def run_pipeline(story_files, ref_files, notes):
     client = genai.Client(api_key=ss.api_key)
     story_parts = to_parts(story_files)
@@ -195,10 +209,8 @@ def run_pipeline(story_files, ref_files, notes):
     if ref_parts:
         contents += ["Extra character/environment reference images:", *ref_parts]
     contents.append(f"Extract everything into this JSON shape:\n{ANALYZE_SCHEMA}{notes_txt}")
-    raw = call_gemini(client, ANALYZE_SYSTEM, contents)
-    try:
-        analysis = parse_json(raw)
-    except json.JSONDecodeError:
+    analysis, raw = generate_json(client, ANALYZE_SYSTEM, contents)
+    if analysis is None:
         status.update(label="Could not parse the storyboard analysis", state="error")
         st.code(raw)
         return
@@ -234,74 +246,106 @@ Previous segment end state: {prev_end or 'n/a (first segment)'}{notes_txt}
 Return JSON matching this shape exactly:
 {GENERATE_SCHEMA}"""
         )
-        raw = call_gemini(client, GENERATE_SYSTEM, contents)
-        try:
-            data = parse_json(raw)
-            prev_end = data.get("end_state", "") if isinstance(data, dict) else ""
-        except json.JSONDecodeError:
+        data, raw = generate_json(client, GENERATE_SYSTEM, contents)
+        if data is None:
             data = {"_raw": raw, "_error": "Model did not return valid JSON"}
+        else:
+            prev_end = data.get("end_state", "")
         ss.results.append((seg, data))
         progress.progress((i + 1) / len(segments))
 
     status.update(label="Done", state="complete", expanded=False)
-    build_final_prompt()
+    build_segment_prompts()
 
 
-def build_final_prompt():
+def build_segment_prompts():
     a = ss.analysis or {}
-    L = ["# TASK: Build a Blender animation via the Blender MCP connector\n"]
-    L.append(
-        "Using the Blender connector, write and execute a Python (bpy) script that builds the scene "
-        "below. Work segment by segment so I can review each one.\n"
-    )
-    L.append("## Requirements")
-    L.append(f"- FPS: {fps}  |  Render engine: {render_engine}")
-    L.append("- Units: metres, Z-up. Rotations are in degrees (Euler XYZ).")
-    if a.get("visual_style"):
-        L.append(f"- Style: {a['visual_style']}")
-    L.append(
-        "- Import each character using its `import_strategy` (local file, Sketchfab, Poly Haven, "
-        "Hyper3D/Hunyuan3D, or a primitive stand-in if unavailable) and apply the exact placement."
-    )
-    L.append("- Use keyframes (`keyframe_insert`) with the times/frames given; set the scene frame range to cover all segments.")
-    L.append("- Name every object clearly so later segments can reference them.")
-    L.append("- After each segment, report what was created and any assumptions or fallbacks.\n")
+    chars = a.get("characters", [])
+    n = len(ss.results)
+    out = []
 
-    if a.get("project_title"):
-        L.append(f"## Project: {a['project_title']}")
-    if a.get("overall_environment"):
-        L.append(f"Environment: {a['overall_environment']}\n")
-
-    L.append("## Characters")
-    for c in a.get("characters", []):
-        L.append(f"- **{c.get('name', 'Unnamed')}** ({c.get('species_or_type', '')}): {c.get('appearance', '')}")
-        if c.get("outfit_and_accessories"):
-            L.append(f"  - Outfit: {c['outfit_and_accessories']}")
-        if c.get("colors"):
-            L.append(f"  - Colors: {c['colors']}")
-        if c.get("approx_height_m"):
-            L.append(f"  - Approx height: {c['approx_height_m']} m")
-
-    L.append("\n## Segments")
     for i, (seg, data) in enumerate(ss.results, 1):
-        L.append(f"\n### Segment {i}: {seg.get('title', 'Untitled')} ({seg.get('start_s')}s–{seg.get('end_s')}s)")
-        if "_raw" in data:
-            L.append(data["_raw"])
-            continue
-        if data.get("summary"):
-            L.append(data["summary"])
-        if data.get("claude_instructions"):
-            L.append(f"\n**Instructions:** {data['claude_instructions']}")
-        L.append("\n```json")
-        L.append(json.dumps(data, indent=2, ensure_ascii=False))
-        L.append("```")
+        title = seg.get("title", "Untitled")
+        ok = isinstance(data, dict) and "_raw" not in data
+        tr = data.get("time_range", {}) if ok else {}
+        start_f = tr.get("start_frame", int(round((seg.get("start_s") or 0) * fps)))
+        end_f = tr.get("end_frame", int(round((seg.get("end_s") or 0) * fps)))
+        prev_end = ""
+        if i > 1 and isinstance(ss.results[i - 2][1], dict):
+            prev_end = ss.results[i - 2][1].get("end_state", "")
 
-    L.append("\n## Deliverable")
-    L.append(
-        "Start with Segment 1: generate the bpy script, execute it through the Blender connector, "
-        "and confirm the result before continuing."
-    )
-    ss.final_prompt = "\n".join(L)
+        L = [f"# TASK: Build Segment {i} of {n}: {title} ({seg.get('start_s')}s to {seg.get('end_s')}s)\n"]
+        L.append(
+            "Use the Blender MCP connector to write and execute a Python (bpy) script that builds "
+            "THIS segment only.\n"
+        )
+
+        L.append("## Scene state")
+        if i == 1:
+            L.append(
+                f"- This is the first segment. Use the open Blender file (clear default objects). "
+                f"Set fps to {fps}, render engine to {render_engine}, frame start 0, frame end {end_f}."
+            )
+        else:
+            L.append(
+                f"- Segments 1 to {i - 1} are already built in the open Blender file. "
+                "Do NOT delete or rebuild them. Reuse existing objects by name where they exist."
+            )
+            L.append(f"- Add this segment on frames {start_f} to {end_f} and extend the scene frame end to {end_f}.")
+            if prev_end:
+                L.append(f"- Previous segment ended with: {prev_end}")
+        L.append("")
+
+        L.append("## Requirements")
+        L.append(f"- FPS: {fps}  |  Render engine: {render_engine}")
+        L.append("- Units: metres, Z-up. Rotations are in degrees (Euler XYZ).")
+        if a.get("visual_style"):
+            L.append(f"- Style: {a['visual_style']}")
+        L.append(
+            "- Import each character using its `import_strategy` (local file, Sketchfab, Poly Haven, "
+            "Hyper3D/Hunyuan3D, or a primitive stand-in if unavailable) and apply the exact placement."
+        )
+        L.append("- Use keyframes (`keyframe_insert`) with the exact times and frames given.")
+        L.append("- Name every object clearly so later segments can reference them.\n")
+
+        if a.get("project_title"):
+            L.append(f"## Project: {a['project_title']}")
+        if a.get("overall_environment"):
+            L.append(f"Environment: {a['overall_environment']}\n")
+
+        names = {c.get("name") for c in data.get("characters", [])} if ok else set()
+        present = [c for c in chars if c.get("name") in names] or chars
+        L.append("## Characters in this segment")
+        for c in present:
+            L.append(f"- **{c.get('name', 'Unnamed')}** ({c.get('species_or_type', '')}): {c.get('appearance', '')}")
+            if c.get("outfit_and_accessories"):
+                L.append(f"  - Outfit: {c['outfit_and_accessories']}")
+            if c.get("colors"):
+                L.append(f"  - Colors: {c['colors']}")
+            if c.get("approx_height_m"):
+                L.append(f"  - Approx height: {c['approx_height_m']} m")
+
+        L.append(f"\n## Segment {i} spec")
+        if ok:
+            if data.get("summary"):
+                L.append(data["summary"])
+            if data.get("claude_instructions"):
+                L.append(f"\n**Instructions:** {data['claude_instructions']}")
+            L.append("\n```json")
+            L.append(json.dumps(data, indent=2, ensure_ascii=False))
+            L.append("```")
+        else:
+            L.append(data.get("_raw", ""))
+
+        L.append("\n## Deliverable")
+        L.append(
+            "Generate the bpy script, execute it through the Blender connector, and report what was "
+            "created plus any assumptions or fallbacks. Then stop and wait for the next segment."
+        )
+        out.append({"title": title, "text": "\n".join(L)})
+
+    ss.segment_prompts = out
+    ss.final_prompt = "\n\n---\n\n".join(p["text"] for p in out)
 
 
 # --------------------------------------------------------------------------- #
@@ -353,13 +397,25 @@ if ss.results:
             else:
                 st.json(data, expanded=False)
 
-if ss.final_prompt:
-    st.subheader("2 · Copy into Claude")
-    st.caption("Use the copy icon at the top-right of the block, or download the file.")
-    st.code(ss.final_prompt, language="markdown", wrap_lines=True)
-    st.download_button(
-        "⬇️ Download as .md",
-        ss.final_prompt,
-        file_name="blender_prompt_for_claude.md",
-        mime="text/markdown",
-    )
+if ss.segment_prompts:
+    st.subheader("2 · Copy one segment at a time into Claude")
+    st.caption("Each tab is a complete, standalone prompt. Copy Segment 1, paste into Claude, wait for it to finish, then do Segment 2.")
+    tabs = st.tabs([f"{i}. {p['title']}" for i, p in enumerate(ss.segment_prompts, 1)])
+    for i, (tab, p) in enumerate(zip(tabs, ss.segment_prompts), 1):
+        with tab:
+            st.code(p["text"], language="markdown", wrap_lines=True)
+            st.download_button(
+                f"⬇️ Download segment {i} (.md)",
+                p["text"],
+                file_name=f"segment_{i}_{p['title'].lower().replace(' ', '_')}.md",
+                mime="text/markdown",
+                key=f"dl_{i}",
+            )
+    with st.expander("All segments in one file"):
+        st.download_button(
+            "⬇️ Download all segments (.md)",
+            ss.final_prompt,
+            file_name="blender_prompts_all_segments.md",
+            mime="text/markdown",
+            key="dl_all",
+        )
