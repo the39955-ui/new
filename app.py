@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+import uuid
 
 import streamlit as st
 from google import genai
@@ -35,6 +36,7 @@ ss.setdefault("api_key", os.environ.get("GEMINI_API_KEY", ""))
 ss.setdefault("models", DEFAULT_MODELS)
 ss.setdefault("plan", None)
 ss.setdefault("assets_text", "")
+ss.setdefault("env_text", "")
 ss.setdefault("segment_prompts", [])
 ss.setdefault("final_prompt", "")
 
@@ -108,8 +110,23 @@ EXISTING ASSETS (most important)
 - For things with no existing asset, give a short appearance and an import_strategy
   (Sketchfab / Poly Haven / Hyper3D / primitive stand-in).
 
+ENVIRONMENT RULE
+- The user message says whether an environment is ALREADY provided in the Blender scene.
+- If provided: use it as-is. Return "environment.objects": [] and set "environment.setting" to its name.
+  Write "keep as is" for lighting and world. "environment_changes" stays empty unless the action strictly
+  needs a small extra prop. Never restyle, rebuild or add a second environment.
+- If NOT provided: create a simple environment that fits the scene AND matches the visual theme of the
+  existing character / vehicle assets (palette, shading style, level of detail), not a generic look.
+
+SCENE-WISE INPUT
+- The input may be scene cards (thumbnail + title + time range + lyrics/dialogue + animation notes) instead of
+  one storyboard sheet. Treat each card as one segment, in order. The thumbnail shows the intended layout; the
+  text gives timing and action. If a time range is missing, estimate it from the scene order.
+- If lyrics or dialogue are given, copy them into "lyrics_or_dialogue" and plan mouth movement (singing or
+  talking) and expressions that follow the lines and their rhythm.
+
 FACIAL PERFORMANCE (required for every character that appears on screen)
-- Analyse each segment's mood, action and caption, then give each character an "emotion_arc" and an
+- Analyse each segment's mood, action, caption and lyrics/dialogue, then give each character an "emotion_arc" and an
   "expressions" timeline that fits the scene (e.g. surprise, laughter, delight, cheeky, sleepy, scared).
 - Each expression entry: time_s, frame, emotion, intensity (0 to 1), and short details for eyes, brows
   and mouth. Include eye direction (what the character looks at), blinks, and mouth motion for talking,
@@ -138,6 +155,7 @@ SCHEMA = """{
     "title": str,
     "time_range": {"start_s": number, "end_s": number, "start_frame": int, "end_frame": int},
     "summary": str,
+    "lyrics_or_dialogue": str|null,
     "environment_changes": [str],
     "characters": [{"name": str, "placement": {"location": [x,y,z], "rotation_deg": [x,y,z]}, "pose_note": str, "emotion_arc": str, "expressions": [{"time_s": number, "frame": int, "emotion": str, "intensity": number, "eyes": str, "brows": str, "mouth": str}]}],
     "camera": {"shot_type": str, "location": [x,y,z], "rotation_deg": [x,y,z], "focal_length_mm": number, "dof": {"enabled": bool, "focus_target": str, "f_stop": number}, "movement": str},
@@ -186,9 +204,10 @@ def generate_plan(client, contents):
     return None, raw
 
 
-def run_pipeline(story_files, asset_text, asset_files, notes):
+def run_pipeline(source_contents, asset_text, env_text, asset_files, notes):
+    """source_contents = storyboard images OR scene cards, already turned into Gemini content parts."""
     client = genai.Client(api_key=ss.api_key)
-    contents = ["Storyboard image(s):", *to_parts(story_files)]
+    contents = [*source_contents]
     if asset_files:
         contents += ["Screenshots of the assets already imported in my Blender scene:", *to_parts(asset_files)]
 
@@ -197,13 +216,16 @@ def run_pipeline(story_files, asset_text, asset_files, notes):
 
 Assets ALREADY imported in my Blender scene (exact Outliner names):
 {asset_text.strip() or 'None. Nothing is imported yet; suggest import strategies.'}
+
+Environment ALREADY in my Blender scene:
+{env_text.strip() or 'NONE provided. Create one that fits the scene and matches the theme of the assets above.'}
 {('Extra notes: ' + notes.strip()) if notes.strip() else ''}
 
 Return JSON in exactly this shape:
 {SCHEMA}"""
     )
 
-    with st.spinner("Gemini is reading the storyboard and planning every segment (1 call)…"):
+    with st.spinner("Gemini is planning every segment (1 call)…"):
         plan, raw = generate_plan(client, contents)
 
     if plan is None:
@@ -212,6 +234,7 @@ Return JSON in exactly this shape:
         return
     ss.plan = plan
     ss.assets_text = asset_text
+    ss.env_text = env_text
     build_segment_prompts()
 
 
@@ -228,9 +251,9 @@ These objects are ALREADY imported and finished. Treat their design as final:
   armature bones, shape keys, materials). Use the REAL measured sizes, not guesses. Put each asset's lowest
   point on the ground, face it correctly, and treat the coordinates in the spec as layout targets that you
   adjust to the real sizes while keeping the same distances, facing and framing.
-- THEME: build the environment, props, lighting and world to match the look of these assets
-  (their materials, palette, shading style such as toon vs PBR, outline, level of detail). The storyboard
-  gives layout, action and mood only.
+- THEME: anything new you add (props, effects, and an environment ONLY if I did not provide one) must match
+  the look of these assets (materials, palette, shading style such as toon vs PBR, outline, level of detail).
+  The storyboard / scene cards give layout, action and mood only.
 - If a needed asset is not in my scene, use a simple stand-in or the import strategy given, and say so.
 
 My asset list:
@@ -256,6 +279,14 @@ Animate every on-screen character's face so it matches the scene. Use the `expre
 - In your report, list per character which controls you used for expressions.
 """
 
+ENV_PROVIDED = """My environment is already in the Blender scene: {env}
+- Use it as-is. Do NOT add, remove, rebuild, restyle, retexture or relight it, and do not add a second
+  environment or extra backdrop objects.
+- Allowed: place characters, vehicles and the camera inside it (inspect it once to find ground level, paths
+  and usable spots), and add only small temporary props or effects the action strictly needs, in the same style.
+- Keep its existing lighting and world. Change them only if the shot is unreadable, and as little as possible."""
+
+
 def vec_safe(d, key, default):
     v = d.get(key)
     return v if v is not None else default
@@ -269,6 +300,7 @@ def build_segment_prompts():
     env = plan.get("environment", {})
     env_names = [o.get("name") for o in env.get("objects", []) if o.get("name")]
     assets = ss.assets_text.strip()
+    env_given = bool(ss.env_text.strip())
     out = []
 
     for i, seg in enumerate(segs, 1):
@@ -328,8 +360,12 @@ def build_segment_prompts():
                 L.append(f"- **{c.get('name')}** → NOT in my scene. {desc} Obtain via: {how}")
 
         L.append("\n## Environment")
-        if i == 1:
-            L.append("Build this persistent environment now (match my assets' style):")
+        if env_given:
+            L.append(ENV_PROVIDED.format(env=ss.env_text.strip()))
+            for ch in seg.get("environment_changes", []):
+                L.append(f"- Small addition needed: {ch}")
+        elif i == 1:
+            L.append("No environment was provided. Create this one now, matching my assets' look and the scene:")
             L.append("```json\n" + json.dumps(env, indent=2, ensure_ascii=False) + "\n```")
         else:
             if env_names:
@@ -340,9 +376,11 @@ def build_segment_prompts():
         L.append(f"\n## Segment {i} spec")
         if seg.get("summary"):
             L.append(seg["summary"])
+        if seg.get("lyrics_or_dialogue"):
+            L.append("\n**Lyrics / dialogue (sync mouth and expressions to these lines):**\n" + seg["lyrics_or_dialogue"])
         if seg.get("claude_instructions"):
             L.append(f"\n**Instructions:** {seg['claude_instructions']}")
-        spec = {k: v for k, v in seg.items() if k not in ("claude_instructions", "summary", "environment_changes")}
+        spec = {k: v for k, v in seg.items() if k not in ("claude_instructions", "summary", "environment_changes", "lyrics_or_dialogue")}
         L.append("\n```json\n" + json.dumps(spec, indent=2, ensure_ascii=False) + "\n```")
 
         L.append("\n## Deliverable")
@@ -358,67 +396,166 @@ def build_segment_prompts():
 
 
 # --------------------------------------------------------------------------- #
-# Main UI
+# Shared UI pieces
 # --------------------------------------------------------------------------- #
-st.title("🎬 Storyboard → Blender Prompts")
-st.caption("Upload the storyboard, list the assets you already imported, get one prompt per segment.")
+IMG_TYPES = ["png", "jpg", "jpeg", "webp"]
 
-story_files = st.file_uploader(
-    "1 · Storyboard image(s)",
-    type=["png", "jpg", "jpeg", "webp"],
-    accept_multiple_files=True,
-)
-if story_files:
-    st.image([f.getvalue() for f in story_files], width=420)
 
-asset_text = st.text_area(
-    "2 · Assets already imported in my Blender scene",
-    placeholder="One per line, exact Outliner name, with what it is. Example:\nBobo (boy character, rigged)\nZia (girl character, rigged)\nBus (school bus vehicle)",
-    height=120,
-    help="Claude will use these exactly as they are and match the scene's theme to them.",
-)
-
-with st.expander("Optional: asset screenshots and notes"):
-    asset_files = st.file_uploader(
-        "Screenshots of your imported assets (helps Gemini match the theme)",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True,
-        key="assets_img",
+def shared_inputs(prefix):
+    asset_text = st.text_area(
+        "Assets already imported in my Blender scene",
+        placeholder="One per line, exact Outliner name, with what it is. Example:\nBobo (boy character, rigged)\nZia (girl character, rigged)\nBus (school bus vehicle)",
+        height=110,
+        key=f"{prefix}_assets",
+        help="Claude uses these exactly as they are and matches anything new to their theme.",
     )
-    notes = st.text_area("Extra notes", placeholder="Anything the storyboard doesn't show.")
-
-if not ss.api_key:
-    st.info("Save your Gemini API key in the sidebar first.")
-
-if st.button("✨ Generate (1 Gemini call)", type="primary", disabled=not (ss.api_key and story_files)):
-    try:
-        run_pipeline(story_files, asset_text, asset_files, notes)
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Generation failed: {e}")
-
-if ss.plan:
-    with st.expander("What Gemini planned (raw JSON)", expanded=False):
-        st.json(ss.plan, expanded=1)
-
-if ss.segment_prompts:
-    st.subheader("3 · Copy one segment at a time into Claude")
-    st.caption("Each tab is a standalone prompt. Copy Segment 1, paste into Claude, wait for it to finish, then do Segment 2.")
-    tabs = st.tabs([f"{i}. {p['title']}" for i, p in enumerate(ss.segment_prompts, 1)])
-    for i, (tab, p) in enumerate(zip(tabs, ss.segment_prompts), 1):
-        with tab:
-            st.code(p["text"], language="markdown", wrap_lines=True)
-            st.download_button(
-                f"⬇️ Download segment {i} (.md)",
-                p["text"],
-                file_name=f"segment_{i}_{p['title'].lower().replace(' ', '_')}.md",
-                mime="text/markdown",
-                key=f"dl_{i}",
-            )
-    with st.expander("All segments in one file"):
-        st.download_button(
-            "⬇️ Download all segments (.md)",
-            ss.final_prompt,
-            file_name="blender_prompts_all_segments.md",
-            mime="text/markdown",
-            key="dl_all",
+    env_text = st.text_area(
+        "Environment already in my Blender scene (optional)",
+        placeholder="Exact Outliner name, e.g. Playground_Env. Leave empty and Claude will build one that matches your assets.",
+        height=70,
+        key=f"{prefix}_env",
+        help="If filled, Claude uses it as-is and adds no environment. If empty, it creates one matching your assets.",
+    )
+    with st.expander("Optional: asset screenshots and notes"):
+        asset_files = st.file_uploader(
+            "Screenshots of your imported assets (helps Gemini match the theme)",
+            type=IMG_TYPES, accept_multiple_files=True, key=f"{prefix}_assets_img",
         )
+        notes = st.text_area("Extra notes", placeholder="Anything else Claude should know.", key=f"{prefix}_notes")
+    return asset_text, env_text, asset_files, notes
+
+
+def render_outputs():
+    if ss.plan:
+        with st.expander("What Gemini planned (raw JSON)", expanded=False):
+            st.json(ss.plan, expanded=1)
+
+    if ss.segment_prompts:
+        st.subheader("Copy one segment at a time into Claude")
+        st.caption("Each tab is a standalone prompt. Copy Segment 1, paste into Claude, wait for it to finish, then do Segment 2.")
+        tabs = st.tabs([f"{i}. {p['title']}" for i, p in enumerate(ss.segment_prompts, 1)])
+        for i, (tab, p) in enumerate(zip(tabs, ss.segment_prompts), 1):
+            with tab:
+                st.code(p["text"], language="markdown", wrap_lines=True)
+                st.download_button(
+                    f"⬇️ Download segment {i} (.md)",
+                    p["text"],
+                    file_name=f"segment_{i}_{p['title'].lower().replace(' ', '_')}.md",
+                    mime="text/markdown",
+                    key=f"dl_{i}",
+                )
+        with st.expander("All segments in one file"):
+            st.download_button(
+                "⬇️ Download all segments (.md)",
+                ss.final_prompt,
+                file_name="blender_prompts_all_segments.md",
+                mime="text/markdown",
+                key="dl_all",
+            )
+
+
+def new_scene():
+    return {"id": uuid.uuid4().hex[:8], "title": "", "time": "", "lyrics": "", "animation": ""}
+
+
+ss.setdefault("scenes", [new_scene()])
+
+
+# --------------------------------------------------------------------------- #
+# Page 1: storyboard image
+# --------------------------------------------------------------------------- #
+def page_storyboard():
+    st.title("🖼️ Storyboard image → Blender prompts")
+    st.caption("Upload one storyboard image. Gemini reads it and plans every segment.")
+    story_files = st.file_uploader("1 · Storyboard image(s)", type=IMG_TYPES, accept_multiple_files=True, key="sb_files")
+    if story_files:
+        st.image([f.getvalue() for f in story_files], width=420)
+    asset_text, env_text, asset_files, notes = shared_inputs("sb")
+
+    if not ss.api_key:
+        st.info("Save your Gemini API key in the sidebar first.")
+    if st.button("✨ Generate (1 Gemini call)", type="primary", disabled=not (ss.api_key and story_files), key="sb_go"):
+        try:
+            run_pipeline(["Storyboard image(s):", *to_parts(story_files)], asset_text, env_text, asset_files, notes)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Generation failed: {e}")
+    render_outputs()
+
+
+# --------------------------------------------------------------------------- #
+# Page 2: scene-wise input
+# --------------------------------------------------------------------------- #
+def page_scenes():
+    st.title("🎞️ Scene-wise input → Blender prompts")
+    st.caption("Add one card per scene: thumbnail, title, time, lyrics or dialogue, and the animation.")
+
+    imgs = {}
+    for i, sc in enumerate(ss.scenes, 1):
+        with st.container(border=True):
+            c_img, c_txt = st.columns([1, 3])
+            with c_img:
+                f = st.file_uploader("Thumbnail", type=IMG_TYPES, key=f"sf_{sc['id']}", label_visibility="collapsed")
+                if f:
+                    st.image(f.getvalue(), use_container_width=True)
+                imgs[sc["id"]] = f
+            with c_txt:
+                r1, r2 = st.columns([3, 1])
+                sc["title"] = r1.text_input(f"Scene {i} title", sc["title"], key=f"st_{sc['id']}", placeholder="Playground fun")
+                sc["time"] = r2.text_input("Time", sc["time"], key=f"sm_{sc['id']}", placeholder="4:00–5:00")
+                sc["lyrics"] = st.text_area(
+                    "Lyrics / dialogue (optional)", sc["lyrics"], key=f"sl_{sc['id']}", height=100,
+                    placeholder="Clap your hands and tap your toes,\nWiggle your fingers, touch your nose!",
+                )
+                sc["animation"] = st.text_area(
+                    "Animation", sc["animation"], key=f"sa_{sc['id']}", height=70,
+                    placeholder="The bus parks safely; Bobo and Zia dance at the playground.",
+                )
+                if len(ss.scenes) > 1 and st.button("Remove scene", key=f"sr_{sc['id']}"):
+                    ss.scenes.remove(sc)
+                    st.rerun()
+
+    if st.button("＋ Add scene", key="add_scene"):
+        ss.scenes.append(new_scene())
+        st.rerun()
+
+    with st.expander("Or paste all scenes as text"):
+        pasted = st.text_area(
+            "Paste scenes in any readable format",
+            height=160,
+            key="sc_pasted",
+            placeholder="Scene 5: Playground fun (4:00–5:00)\nClap your hands and tap your toes...\nAnimation: The bus parks safely; Bobo and Zia dance at the playground.",
+        )
+
+    st.divider()
+    asset_text, env_text, asset_files, notes = shared_inputs("sc")
+
+    has_input = any(sc["title"] or sc["lyrics"] or sc["animation"] or imgs.get(sc["id"]) for sc in ss.scenes) or pasted.strip()
+    if not ss.api_key:
+        st.info("Save your Gemini API key in the sidebar first.")
+    if st.button("✨ Generate (1 Gemini call)", type="primary", disabled=not (ss.api_key and has_input), key="sc_go"):
+        contents = ["Scene cards, in order:"]
+        for i, sc in enumerate(ss.scenes, 1):
+            if not (sc["title"] or sc["lyrics"] or sc["animation"] or imgs.get(sc["id"])):
+                continue
+            contents.append(
+                f"Scene {i}: {sc['title'] or 'Untitled'} ({sc['time'] or 'time not given'})\n"
+                f"Lyrics/dialogue: {sc['lyrics'] or 'none'}\nAnimation: {sc['animation'] or 'not given'}"
+            )
+            if imgs.get(sc["id"]):
+                contents += [f"Thumbnail for scene {i}:", *to_parts([imgs[sc["id"]]])]
+        if pasted.strip():
+            contents.append("Scenes pasted as text:\n" + pasted.strip())
+        try:
+            run_pipeline(contents, asset_text, env_text, asset_files, notes)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Generation failed: {e}")
+    render_outputs()
+
+
+pg = st.navigation(
+    [
+        st.Page(page_storyboard, title="Storyboard image", icon="🖼️", default=True),
+        st.Page(page_scenes, title="Scene-wise input", icon="🎞️"),
+    ]
+)
+pg.run()
