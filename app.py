@@ -86,6 +86,13 @@ with st.sidebar:
     st.header("⚙️ Scene overrides")
     fps = st.number_input("Frame rate (fps)", 12, 60, 24)
     render_engine = st.selectbox("Render engine", ["EEVEE", "Cycles"])
+    prompt_size = st.radio(
+        "Prompt size",
+        ["3 small parts per segment (resume-friendly)", "1 prompt per segment"],
+        index=0,
+        help="Small parts use less of a free account's limit and can be resumed in any chat or account.",
+    )
+    split_parts = prompt_size.startswith("3")
 
 # --------------------------------------------------------------------------- #
 # Prompts for Gemini (ONE call does everything)
@@ -305,6 +312,23 @@ def vec_safe(d, key, default):
     return v if v is not None else default
 
 
+ASSET_RULES_SHORT = """## My assets (READ-ONLY)
+{assets}
+Use them exactly as they are: never remodel, retexture, recolour, re-material, rescale, or edit rigs, shape keys,
+modifiers or origins. Only object-level location / rotation and the values of controls they already have.
+Use measured real sizes, not guesses. Reuse objects already in the file by name."""
+
+LOG_RULES = """## Progress log (lets any chat or account resume this work)
+- Keep a Blender text datablock named BUILD_LOG (create it if missing). Read it first and print at most its last 40 lines.
+- If `{code}` is already logged as DONE, tell me and stop. {dep}
+- When finished, append ONE short line: `{code} DONE | frames A-B | objects created or reused (names only) | fallbacks`.
+- Then save the file with bpy.ops.wm.save_mainfile() if it has a path."""
+
+
+def fence(obj):
+    return "```json\n" + json.dumps(obj, indent=2, ensure_ascii=False) + "\n```"
+
+
 def build_segment_prompts():
     plan = ss.plan or {}
     segs = plan.get("segments", [])
@@ -323,90 +347,154 @@ def build_segment_prompts():
         start_f = tr.get("start_frame", int(round((s_s or 0) * fps)))
         end_f = tr.get("end_frame", int(round((e_s or 0) * fps)))
         prev_end = segs[i - 2].get("end_state", "") if i > 1 else ""
+        seg_chars = seg.get("characters", [])
+        cam = seg.get("camera", {})
 
-        L = [f"# TASK: Build Segment {i} of {n}: {title} ({s_s}s to {e_s}s)\n"]
-        L.append(
-            "Use the Blender MCP connector to build THIS segment only. Keep tool calls minimal: "
-            "one COMPACT scene inspection, then ONE bpy script that builds and keyframes everything, "
-            "then one quick check. Keep every tool result small (limits below).\n"
-        )
+        def who():
+            L = ["## Who is in this segment"]
+            for c in seg_chars:
+                info = cmap.get(c.get("name"), {})
+                if info.get("existing_asset"):
+                    L.append(f"- **{c.get('name')}** → my existing asset `{info['existing_asset']}` (do not modify it)")
+                else:
+                    how = info.get("import_strategy") or "simple stand-in shape"
+                    L.append(f"- **{c.get('name')}** → NOT in my scene. {info.get('appearance') or ''} Build as: {how}")
+            return L
 
-        L.append("## Scene state")
-        if i == 1:
-            L.append(
-                f"- First segment. Use the open Blender file and KEEP my imported assets untouched. "
-                f"Remove only default cube/light/camera if present. FPS {fps}, engine {render_engine}, "
-                f"frame start 0, frame end {end_f}."
-            )
-        else:
-            L.append(
-                f"- Segments 1 to {i - 1} are already built in the open file. Do NOT delete or rebuild them."
-                " Reuse existing objects by name."
-            )
-            L.append(f"- Add this segment on frames {start_f} to {end_f} and extend the frame end to {end_f}.")
-            if prev_end:
-                L.append(f"- Previous segment ended with: {prev_end}")
-        L.append("")
-
-        if assets:
-            L.append(ASSET_RULES.format(assets=assets))
-
-        L.append(FACE_RULES)
-        L.append(OUTPUT_LIMITS)
-
-        L.append("## Requirements")
-        L.append(f"- FPS {fps} | Engine {render_engine} | Units metres, Z-up | Rotations in degrees (Euler XYZ)")
-        if plan.get("visual_theme_notes"):
-            L.append(f"- Theme: {plan['visual_theme_notes']}")
-        L.append("- Use `keyframe_insert` with the exact frames given. Name every object clearly.\n")
-
-        if plan.get("project_title"):
-            L.append(f"## Project: {plan['project_title']}")
-
-        L.append("## Who is in this segment")
-        for c in seg.get("characters", []):
-            info = cmap.get(c.get("name"), {})
-            if info.get("existing_asset"):
-                L.append(f"- **{c.get('name')}** → my existing asset `{info['existing_asset']}` (do not modify it)")
+        def layout_block():
+            L = ["## Scene state"]
+            if i == 1:
+                L.append(
+                    f"- First segment. Use the open Blender file and KEEP my imported assets untouched. "
+                    f"Remove only default cube/light/camera if present. FPS {fps}, engine {render_engine}, "
+                    f"frame start 0, frame end {end_f}."
+                )
             else:
-                desc = info.get("appearance") or ""
-                how = info.get("import_strategy") or "simple stand-in"
-                L.append(f"- **{c.get('name')}** → NOT in my scene. {desc} Obtain via: {how}")
+                L.append(f"- Segments 1 to {i - 1} are already built in the open file. Do NOT delete or rebuild them.")
+                L.append(f"- Add this segment on frames {start_f} to {end_f} and extend the frame end to {end_f}.")
+                if prev_end:
+                    L.append(f"- Previous segment ended with: {prev_end}")
+            L.append("")
+            if assets:
+                L.append(ASSET_RULES.format(assets=assets))
+            L.append("## Requirements")
+            L.append(f"- FPS {fps} | Engine {render_engine} | Units metres, Z-up | Rotations in degrees (Euler XYZ)")
+            if plan.get("visual_theme_notes"):
+                L.append(f"- Theme: {plan['visual_theme_notes']}")
+            L.append("- Name every object clearly.\n")
+            if plan.get("project_title"):
+                L.append(f"## Project: {plan['project_title']}")
+            L += who()
+            L.append("\n## Environment")
+            if env_given:
+                L.append(ENV_PROVIDED.format(env=ss.env_text.strip()))
+                for ch in seg.get("environment_changes", []):
+                    L.append(f"- Small addition needed: {ch}")
+            elif i == 1:
+                L.append("No environment was provided. Create this one now, matching my assets' look and the scene:")
+                L.append(fence(env))
+            else:
+                if env_names:
+                    L.append("Already built in earlier segments: " + ", ".join(env_names) + ".")
+                for ch in seg.get("environment_changes", []):
+                    L.append(f"- Change: {ch}")
+            L.append("\n## Layout spec (place everything at the start of this segment)")
+            if seg.get("summary"):
+                L.append(seg["summary"])
+            layout = {
+                "time_range": tr,
+                "characters": [
+                    {"name": c.get("name"), "placement": c.get("placement"), "pose_note": c.get("pose_note")}
+                    for c in seg_chars
+                ],
+                "camera_start": {k: cam.get(k) for k in ("shot_type", "location", "rotation_deg", "focal_length_mm", "dof")},
+            }
+            L.append(fence(layout))
+            return L
 
-        L.append("\n## Environment")
-        if env_given:
-            L.append(ENV_PROVIDED.format(env=ss.env_text.strip()))
-            for ch in seg.get("environment_changes", []):
-                L.append(f"- Small addition needed: {ch}")
-        elif i == 1:
-            L.append("No environment was provided. Create this one now, matching my assets' look and the scene:")
-            L.append("```json\n" + json.dumps(env, indent=2, ensure_ascii=False) + "\n```")
-        else:
-            if env_names:
-                L.append("Already built in earlier segments: " + ", ".join(env_names) + ".")
-            for ch in seg.get("environment_changes", []):
-                L.append(f"- Change: {ch}")
+        def motion_block(short_assets):
+            L = []
+            if short_assets and assets:
+                L.append(ASSET_RULES_SHORT.format(assets=assets))
+                L.append("")
+            L += who()
+            L.append("\n## Motion spec (body, objects, camera)")
+            if seg.get("claude_instructions"):
+                L.append(f"**Instructions:** {seg['claude_instructions']}")
+            L.append(fence({"time_range": tr, "animation": seg.get("animation", []), "camera_movement": cam.get("movement")}))
+            if seg.get("end_state"):
+                L.append(f"End of segment should look like: {seg['end_state']}")
+            L.append("- Use `keyframe_insert` with the exact frames given.")
+            return L
 
-        L.append(f"\n## Segment {i} spec")
-        if seg.get("summary"):
-            L.append(seg["summary"])
-        if seg.get("lyrics_or_dialogue"):
-            L.append("\n**Lyrics / dialogue (sync mouth and expressions to these lines):**\n" + seg["lyrics_or_dialogue"])
-        if seg.get("claude_instructions"):
-            L.append(f"\n**Instructions:** {seg['claude_instructions']}")
-        spec = {k: v for k, v in seg.items() if k not in ("claude_instructions", "summary", "environment_changes", "lyrics_or_dialogue")}
-        L.append("\n```json\n" + json.dumps(spec, indent=2, ensure_ascii=False) + "\n```")
+        def faces_block(short_assets):
+            L = []
+            if short_assets and assets:
+                L.append(ASSET_RULES_SHORT.format(assets=assets))
+                L.append("")
+            L += who()
+            L.append("")
+            L.append(FACE_RULES)
+            if seg.get("lyrics_or_dialogue"):
+                L.append("**Lyrics / dialogue (sync mouth and expressions to these lines):**\n" + seg["lyrics_or_dialogue"] + "\n")
+            L.append("## Expression plan")
+            L.append(fence({
+                "time_range": tr,
+                "characters": [
+                    {"name": c.get("name"), "emotion_arc": c.get("emotion_arc"), "expressions": c.get("expressions", [])}
+                    for c in seg_chars
+                ],
+            }))
+            return L
 
-        L.append("\n## Deliverable")
-        L.append(
-            "Run the script through the connector, then report in a few lines what was created or reused, "
-            "which facial controls drove each character's expressions, and any assumptions or fallbacks. "
-            "Then stop and wait for the next segment."
+        intro = (
+            "Use the Blender MCP connector. Keep tool calls minimal: one COMPACT inspection, then ONE bpy "
+            "script that does this part, then one quick check. Keep every tool result small (limits below).\n"
         )
-        out.append({"title": title, "text": "\n".join(L)})
+        done_layout = "Run the script, then report in 3 lines what was created or reused and any fallbacks. Then stop and wait for the next part."
+        done_motion = done_layout
+        done_faces = (
+            "Run the script, then report in 3 lines which facial controls drove each character's expressions, "
+            "and any fallbacks. Then stop and wait for the next part."
+        )
+
+        parts = []
+        if split_parts:
+            total = 3
+            prev_seg_dep = (
+                f"If the previous segment (S{i - 1}P3) is not logged DONE, tell me and stop." if i > 1 else ""
+            )
+            specs = [
+                ("Layout", 1, layout_block(), done_layout, prev_seg_dep, False),
+                ("Motion", 2, motion_block(True), done_motion, f"If S{i}P1 is not logged DONE, tell me and stop.", False),
+                ("Faces", 3, faces_block(True), done_faces, f"If S{i}P2 is not logged DONE, tell me and stop.", False),
+            ]
+            for label, k, blocks, done, dep, _ in specs:
+                code = f"S{i}P{k}"
+                L = [f"# TASK: Segment {i} of {n} ({title}, {s_s}s to {e_s}s) · Part {k} of {total}: {label}\n", intro]
+                L.append(LOG_RULES.format(code=code, dep=dep) + "\n")
+                L += blocks
+                L.append("\n" + OUTPUT_LIMITS)
+                L.append("## Deliverable\n" + done)
+                parts.append({"label": label, "text": "\n".join(L)})
+        else:
+            code = f"S{i}"
+            dep = f"If the previous segment (S{i - 1}) is not logged DONE, tell me and stop." if i > 1 else ""
+            L = [f"# TASK: Build Segment {i} of {n}: {title} ({s_s}s to {e_s}s)\n", intro]
+            L.append(LOG_RULES.format(code=code, dep=dep) + "\n")
+            L += layout_block()
+            L.append("")
+            L += motion_block(False)
+            L.append("")
+            L += faces_block(False)
+            L.append("\n" + OUTPUT_LIMITS)
+            L.append("## Deliverable\n" + done_faces)
+            parts.append({"label": "Full segment", "text": "\n".join(L)})
+
+        out.append({"title": title, "parts": parts})
 
     ss.segment_prompts = out
-    ss.final_prompt = "\n\n---\n\n".join(p["text"] for p in out)
+    ss.final_prompt = "\n\n---\n\n".join(pt["text"] for seg in out for pt in seg["parts"])
 
 
 # --------------------------------------------------------------------------- #
@@ -445,24 +533,31 @@ def render_outputs():
             st.json(ss.plan, expanded=1)
 
     if ss.segment_prompts:
-        st.subheader("Copy one segment at a time into Claude")
-        st.caption("Each tab is a standalone prompt. Copy Segment 1, paste into Claude, wait for it to finish, then do Segment 2.")
-        tabs = st.tabs([f"{i}. {p['title']}" for i, p in enumerate(ss.segment_prompts, 1)])
-        for i, (tab, p) in enumerate(zip(tabs, ss.segment_prompts), 1):
+        st.subheader("Copy one part at a time into Claude")
+        st.caption(
+            "Every part is small and standalone. Progress is saved in a BUILD_LOG inside your .blend file, so if "
+            "your account runs out: save the .blend, switch account, open the same file, and paste the next part. "
+            "Claude skips anything already done."
+        )
+        tabs = st.tabs([f"{i}. {sg['title']}" for i, sg in enumerate(ss.segment_prompts, 1)])
+        for i, (tab, sg) in enumerate(zip(tabs, ss.segment_prompts), 1):
             with tab:
-                st.code(p["text"], language="markdown", wrap_lines=True)
-                st.download_button(
-                    f"⬇️ Download segment {i} (.md)",
-                    p["text"],
-                    file_name=f"segment_{i}_{p['title'].lower().replace(' ', '_')}.md",
-                    mime="text/markdown",
-                    key=f"dl_{i}",
-                )
-        with st.expander("All segments in one file"):
+                total = len(sg["parts"])
+                for k, part in enumerate(sg["parts"], 1):
+                    st.markdown(f"**Part {k} of {total} · {part['label']}**  ·  ≈ {len(part['text']) // 4:,} tokens")
+                    st.code(part["text"], language="markdown", wrap_lines=True)
+                    st.download_button(
+                        f"⬇️ Download part {k} (.md)",
+                        part["text"],
+                        file_name=f"segment_{i}_part_{k}_{part['label'].lower().replace(' ', '_')}.md",
+                        mime="text/markdown",
+                        key=f"dl_{i}_{k}",
+                    )
+        with st.expander("Everything in one file"):
             st.download_button(
-                "⬇️ Download all segments (.md)",
+                "⬇️ Download all parts (.md)",
                 ss.final_prompt,
-                file_name="blender_prompts_all_segments.md",
+                file_name="blender_prompts_all_parts.md",
                 mime="text/markdown",
                 key="dl_all",
             )
