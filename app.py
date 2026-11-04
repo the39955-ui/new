@@ -1,7 +1,9 @@
 """
-Storyboard -> Blender Prompt Generator
-Upload a storyboard image. Gemini reads it, extracts characters / segments / timing,
-then generates Blender-ready specs you paste into Claude (Blender MCP).
+Storyboard -> Blender Prompt Generator (asset-aware, single Gemini call)
+
+Upload a storyboard, list the assets you've ALREADY imported in Blender (Bobo, Zia, Bus...),
+and Gemini produces one standalone prompt per segment. Paste each into Claude (Blender MCP).
+Claude is told to use your assets as-is and to match the scene's theme to them.
 
 Run:
     pip install -r requirements.txt
@@ -31,10 +33,10 @@ DEFAULT_MODELS = [
 ss = st.session_state
 ss.setdefault("api_key", os.environ.get("GEMINI_API_KEY", ""))
 ss.setdefault("models", DEFAULT_MODELS)
-ss.setdefault("analysis", None)
-ss.setdefault("results", [])
-ss.setdefault("final_prompt", "")
+ss.setdefault("plan", None)
+ss.setdefault("assets_text", "")
 ss.setdefault("segment_prompts", [])
+ss.setdefault("final_prompt", "")
 
 # --------------------------------------------------------------------------- #
 # Sidebar
@@ -76,81 +78,63 @@ with st.sidebar:
         except Exception as e:  # noqa: BLE001
             st.error(f"Could not fetch models: {e}")
     model = st.selectbox("Gemini multimodal model", ss.models)
-    temperature = st.slider("Temperature", 0.0, 1.5, 0.4, 0.1)
+    temperature = st.slider("Temperature", 0.0, 1.5, 0.3, 0.1)
 
     st.divider()
-    st.header("⚙️ Optional overrides")
+    st.header("⚙️ Scene overrides")
     fps = st.number_input("Frame rate (fps)", 12, 60, 24)
     render_engine = st.selectbox("Render engine", ["EEVEE", "Cycles"])
 
 # --------------------------------------------------------------------------- #
-# Prompts
+# Prompts for Gemini (ONE call does everything)
 # --------------------------------------------------------------------------- #
-ANALYZE_SYSTEM = """You read animation storyboards and extract every detail needed to build the scene in 3D.
-Read ALL text and visuals in the image(s): title, panel numbers, timecodes, panel titles, captions, characters,
-outfits, props, environment, lighting, camera angles and actions. Infer anything not written from the visuals.
-Convert timecodes like "0:35 – 0:55" to seconds. Return ONLY valid JSON."""
+SYSTEM = """You are a technical director converting an animation storyboard into Blender-ready scene specs.
+Another AI (Claude, with a Blender MCP connector) will read your output and write bpy scripts.
 
-ANALYZE_SCHEMA = """{
+STORYBOARD READING
+- Read ALL text and visuals: title, panel numbers, timecodes ("0:35 - 0:55" -> seconds), captions, characters,
+  props, environment, camera angles, actions.
+
+EXISTING ASSETS (most important)
+- The user may list assets ALREADY imported in their Blender scene (names as shown in the Outliner).
+- Map every storyboard character / vehicle / prop to the closest listed asset and put its EXACT listed name
+  in "existing_asset". If nothing matches, set "existing_asset" to null.
+- Existing assets are READ-ONLY. For them give ONLY object-level location and rotation_deg and animation of
+  location / rotation (or existing pose bones / shape keys if the user says they exist). NEVER give scale,
+  materials, colours, redesign or "appearance" changes for them. Do not describe how they look.
+- The scene's look must follow the user's assets, not generic defaults: in "visual_theme_notes" say that the
+  environment, props, lighting and world should be built to match the style of the existing assets
+  (inspect their materials and palette). Use the storyboard only for layout, action and mood.
+- For things with no existing asset, give a short appearance and an import_strategy
+  (Sketchfab / Poly Haven / Hyper3D / primitive stand-in).
+
+SPEC RULES
+- Blender: right-handed, Z-up, metres, degrees (Euler XYZ), camera looks down local -Z.
+- Coordinates are layout targets; the real asset sizes are unknown to you, so keep relationships
+  (distances, facing, framing) rather than absolute precision.
+- Define the persistent environment ONCE at top level. Per segment list only "environment_changes".
+- Times are seconds from the start of the whole animation, plus frame numbers at the given fps.
+- Be concise: no filler, no repeated information, keyframes only where motion happens.
+- Return ONLY strict JSON: double-quoted keys, no comments, no trailing commas, no extra keys."""
+
+SCHEMA = """{
   "project_title": str,
-  "visual_style": str,
-  "overall_environment": str,
+  "visual_theme_notes": str,
   "total_duration_s": number,
-  "characters": [{
-    "name": str,
-    "species_or_type": str,
-    "appearance": str,
-    "outfit_and_accessories": str,
-    "colors": str,
-    "approx_height_m": number,
-    "personality": str
-  }],
+  "characters": [{"name": str, "kind": "character"|"vehicle"|"prop", "existing_asset": str|null, "appearance": str|null, "import_strategy": str|null}],
+  "environment": {"setting": str, "objects": [{"name": str, "type": str, "location": [x,y,z], "rotation_deg": [x,y,z], "scale": [x,y,z]}], "lighting": str, "world_background": str},
   "segments": [{
     "number": int,
     "title": str,
-    "start_s": number,
-    "end_s": number,
-    "caption_text": str,
-    "visual_description": str,
-    "characters_present": [str],
-    "actions": [str],
-    "camera": str,
-    "props_and_effects": [str],
-    "mood_and_lighting": str
+    "time_range": {"start_s": number, "end_s": number, "start_frame": int, "end_frame": int},
+    "summary": str,
+    "environment_changes": [str],
+    "characters": [{"name": str, "placement": {"location": [x,y,z], "rotation_deg": [x,y,z]}, "pose_note": str}],
+    "camera": {"shot_type": str, "location": [x,y,z], "rotation_deg": [x,y,z], "focal_length_mm": number, "dof": {"enabled": bool, "focus_target": str, "f_stop": number}, "movement": str},
+    "animation": [{"target": str, "action": str, "keyframes": [{"time_s": number, "frame": int, "property": str, "value": str}], "easing": str}],
+    "claude_instructions": str,
+    "end_state": str
   }]
-}"""
-
-GENERATE_SYSTEM = """You are a technical director who converts storyboard segments into precise, Blender-ready
-scene specifications. Another AI (Claude, using a Blender MCP connector) will read your output and write a
-Blender Python (bpy) script, so be concrete and unambiguous.
-
-Rules:
-- Blender conventions: right-handed, Z-up, metres, rotations in degrees (Euler XYZ), camera looks down its local -Z.
-- Every character needs import instructions (how to obtain/import the asset) AND exact placement
-  (location, rotation, scale) plus a starting pose.
-- Fill in every detail the storyboard leaves out (positions, distances, lens, easing, timing) with sensible values.
-- Times are in seconds from the start of the whole animation; also give frame numbers at the stated fps.
-- Animation is a list of keyframes with explicit values; avoid vague words.
-- Maintain continuity with the previous segment's end state when provided.
-- Return ONLY valid JSON, no markdown fences."""
-
-GENERATE_SCHEMA = """{
-  "segment_title": str,
-  "time_range": {"start_s": number, "end_s": number, "start_frame": int, "end_frame": int},
-  "summary": str,
-  "environment": {"setting": str, "objects": [{"name": str, "type": str, "location": [x,y,z], "rotation_deg": [x,y,z], "scale": [x,y,z]}], "lighting": str, "world_background": str},
-  "characters": [{
-     "name": str,
-     "import_strategy": str,
-     "placement": {"location": [x,y,z], "rotation_deg": [x,y,z], "scale": [x,y,z]},
-     "initial_pose": str,
-     "materials_notes": str,
-     "rig_notes": str
-  }],
-  "camera": {"shot_type": str, "location": [x,y,z], "rotation_deg": [x,y,z], "focal_length_mm": number, "dof": {"enabled": bool, "focus_target": str, "f_stop": number}, "movement": str},
-  "animation": [{"target": str, "action": str, "keyframes": [{"time_s": number, "frame": int, "property": str, "value": str}], "easing": str}],
-  "claude_instructions": str,
-  "end_state": str
 }"""
 
 # --------------------------------------------------------------------------- #
@@ -164,183 +148,177 @@ def to_parts(files):
 
 
 def parse_json(text):
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
-    return json.loads(text)
+    return json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip()))
 
 
-def call_gemini(client, system, contents):
+def call_gemini(client, contents):
     cfg = types.GenerateContentConfig(
-        system_instruction=system,
+        system_instruction=SYSTEM,
         temperature=temperature,
         response_mime_type="application/json",
     )
-    err = None
-    for attempt in range(3):
-        try:
-            return client.models.generate_content(model=model, contents=contents, config=cfg).text
-        except Exception as e:  # noqa: BLE001
-            err = e
-            time.sleep(2 * (attempt + 1))
-    raise err
+    return client.models.generate_content(model=model, contents=contents, config=cfg).text
 
 
-def generate_json(client, system, contents, tries=3):
-    """Call Gemini and return (parsed_json, raw_text). Retries if JSON is invalid."""
+def generate_plan(client, contents):
+    """One call normally. A single retry only if the JSON is broken or the request errors."""
     raw = ""
-    for _ in range(tries):
-        raw = call_gemini(client, system, contents)
+    for attempt in range(2):
         try:
+            raw = call_gemini(client, contents)
             return parse_json(raw), raw
         except json.JSONDecodeError:
-            contents = [*contents, "Your previous reply was not valid JSON. Return ONLY strict JSON: "
-                        "double-quoted keys, no comments, no trailing commas, no extra keys."]
+            contents = [*contents, "Your previous reply was not valid JSON. Return strict JSON only."]
+        except Exception:  # noqa: BLE001
+            if attempt == 1:
+                raise
+            time.sleep(3)
     return None, raw
 
 
-def run_pipeline(story_files, ref_files, notes):
+def run_pipeline(story_files, asset_text, asset_files, notes):
     client = genai.Client(api_key=ss.api_key)
-    story_parts = to_parts(story_files)
-    ref_parts = to_parts(ref_files)
-    notes_txt = f"\nExtra notes from the user: {notes}" if notes.strip() else ""
+    contents = ["Storyboard image(s):", *to_parts(story_files)]
+    if asset_files:
+        contents += ["Screenshots of the assets already imported in my Blender scene:", *to_parts(asset_files)]
 
-    # ---- Stage 1: read the storyboard ------------------------------------ #
-    status = st.status("Reading storyboard…", expanded=True)
-    contents = ["Storyboard image(s):", *story_parts]
-    if ref_parts:
-        contents += ["Extra character/environment reference images:", *ref_parts]
-    contents.append(f"Extract everything into this JSON shape:\n{ANALYZE_SCHEMA}{notes_txt}")
-    analysis, raw = generate_json(client, ANALYZE_SYSTEM, contents)
-    if analysis is None:
-        status.update(label="Could not parse the storyboard analysis", state="error")
-        st.code(raw)
-        return
-    ss.analysis = analysis
-    segments = analysis.get("segments", [])
-    status.write(
-        f"Found {len(analysis.get('characters', []))} characters and {len(segments)} segments."
+    contents.append(
+        f"""FPS: {fps} | Render engine: {render_engine}
+
+Assets ALREADY imported in my Blender scene (exact Outliner names):
+{asset_text.strip() or 'None. Nothing is imported yet; suggest import strategies.'}
+{('Extra notes: ' + notes.strip()) if notes.strip() else ''}
+
+Return JSON in exactly this shape:
+{SCHEMA}"""
     )
 
-    # ---- Stage 2: one Blender spec per segment --------------------------- #
-    ss.results = []
-    prev_end = ""
-    progress = st.progress(0.0)
-    for i, seg in enumerate(segments):
-        status.write(f"Generating segment {i + 1}/{len(segments)}: {seg.get('title', '')}")
-        contents = ["Storyboard image(s):", *story_parts]
-        if ref_parts:
-            contents += ["Extra reference images:", *ref_parts]
-        contents.append(
-            f"""Project: {analysis.get('project_title', '')}
-Visual style: {analysis.get('visual_style', '')}
-Overall environment: {analysis.get('overall_environment', '')}
-FPS: {fps} | Render engine: {render_engine}
+    with st.spinner("Gemini is reading the storyboard and planning every segment (1 call)…"):
+        plan, raw = generate_plan(client, contents)
 
-Characters:
-{json.dumps(analysis.get('characters', []), indent=2)}
-
-Segment to build now ({i + 1} of {len(segments)}):
-{json.dumps(seg, indent=2)}
-
-Previous segment end state: {prev_end or 'n/a (first segment)'}{notes_txt}
-
-Return JSON matching this shape exactly:
-{GENERATE_SCHEMA}"""
-        )
-        data, raw = generate_json(client, GENERATE_SYSTEM, contents)
-        if data is None:
-            data = {"_raw": raw, "_error": "Model did not return valid JSON"}
-        else:
-            prev_end = data.get("end_state", "")
-        ss.results.append((seg, data))
-        progress.progress((i + 1) / len(segments))
-
-    status.update(label="Done", state="complete", expanded=False)
+    if plan is None:
+        st.error("Gemini returned invalid JSON twice. Try again or switch to a stronger model.")
+        st.code(raw)
+        return
+    ss.plan = plan
+    ss.assets_text = asset_text
     build_segment_prompts()
 
 
+# --------------------------------------------------------------------------- #
+# Per-segment prompt for Claude
+# --------------------------------------------------------------------------- #
+ASSET_RULES = """## My assets already in the Blender scene (READ-ONLY)
+These objects are ALREADY imported and finished. Treat their design as final:
+- Do NOT import, duplicate, remodel, retexture, recolour, re-material, add or remove modifiers,
+  edit meshes / rigs / shape keys, change origins, or change scale or dimensions.
+- Only change object-level location and rotation (and use existing pose bones / shape keys / actions if
+  they exist). Never apply or bake transforms in a way that alters the mesh.
+- Before building, inspect the scene ONCE (names, types, dimensions, bounding boxes, forward axis,
+  armature bones, shape keys, materials). Use the REAL measured sizes, not guesses. Put each asset's lowest
+  point on the ground, face it correctly, and treat the coordinates in the spec as layout targets that you
+  adjust to the real sizes while keeping the same distances, facing and framing.
+- THEME: build the environment, props, lighting and world to match the look of these assets
+  (their materials, palette, shading style such as toon vs PBR, outline, level of detail). The storyboard
+  gives layout, action and mood only.
+- If a needed asset is not in my scene, use a simple stand-in or the import strategy given, and say so.
+
+My asset list:
+{assets}
+"""
+
+
+def vec_safe(d, key, default):
+    v = d.get(key)
+    return v if v is not None else default
+
+
 def build_segment_prompts():
-    a = ss.analysis or {}
-    chars = a.get("characters", [])
-    n = len(ss.results)
+    plan = ss.plan or {}
+    segs = plan.get("segments", [])
+    n = len(segs)
+    cmap = {c.get("name"): c for c in plan.get("characters", [])}
+    env = plan.get("environment", {})
+    env_names = [o.get("name") for o in env.get("objects", []) if o.get("name")]
+    assets = ss.assets_text.strip()
     out = []
 
-    for i, (seg, data) in enumerate(ss.results, 1):
+    for i, seg in enumerate(segs, 1):
         title = seg.get("title", "Untitled")
-        ok = isinstance(data, dict) and "_raw" not in data
-        tr = data.get("time_range", {}) if ok else {}
-        start_f = tr.get("start_frame", int(round((seg.get("start_s") or 0) * fps)))
-        end_f = tr.get("end_frame", int(round((seg.get("end_s") or 0) * fps)))
-        prev_end = ""
-        if i > 1 and isinstance(ss.results[i - 2][1], dict):
-            prev_end = ss.results[i - 2][1].get("end_state", "")
+        tr = seg.get("time_range", {})
+        s_s, e_s = tr.get("start_s"), tr.get("end_s")
+        start_f = tr.get("start_frame", int(round((s_s or 0) * fps)))
+        end_f = tr.get("end_frame", int(round((e_s or 0) * fps)))
+        prev_end = segs[i - 2].get("end_state", "") if i > 1 else ""
 
-        L = [f"# TASK: Build Segment {i} of {n}: {title} ({seg.get('start_s')}s to {seg.get('end_s')}s)\n"]
+        L = [f"# TASK: Build Segment {i} of {n}: {title} ({s_s}s to {e_s}s)\n"]
         L.append(
-            "Use the Blender MCP connector to write and execute a Python (bpy) script that builds "
-            "THIS segment only.\n"
+            "Use the Blender MCP connector to build THIS segment only. Keep tool calls minimal: "
+            "one scene inspection, then ONE bpy script that builds and keyframes everything, "
+            "then one quick check.\n"
         )
 
         L.append("## Scene state")
         if i == 1:
             L.append(
-                f"- This is the first segment. Use the open Blender file (clear default objects). "
-                f"Set fps to {fps}, render engine to {render_engine}, frame start 0, frame end {end_f}."
+                f"- First segment. Use the open Blender file and KEEP my imported assets untouched. "
+                f"Remove only default cube/light/camera if present. FPS {fps}, engine {render_engine}, "
+                f"frame start 0, frame end {end_f}."
             )
         else:
             L.append(
-                f"- Segments 1 to {i - 1} are already built in the open Blender file. "
-                "Do NOT delete or rebuild them. Reuse existing objects by name where they exist."
+                f"- Segments 1 to {i - 1} are already built in the open file. Do NOT delete or rebuild them."
+                " Reuse existing objects by name."
             )
-            L.append(f"- Add this segment on frames {start_f} to {end_f} and extend the scene frame end to {end_f}.")
+            L.append(f"- Add this segment on frames {start_f} to {end_f} and extend the frame end to {end_f}.")
             if prev_end:
                 L.append(f"- Previous segment ended with: {prev_end}")
         L.append("")
 
+        if assets:
+            L.append(ASSET_RULES.format(assets=assets))
+
         L.append("## Requirements")
-        L.append(f"- FPS: {fps}  |  Render engine: {render_engine}")
-        L.append("- Units: metres, Z-up. Rotations are in degrees (Euler XYZ).")
-        if a.get("visual_style"):
-            L.append(f"- Style: {a['visual_style']}")
-        L.append(
-            "- Import each character using its `import_strategy` (local file, Sketchfab, Poly Haven, "
-            "Hyper3D/Hunyuan3D, or a primitive stand-in if unavailable) and apply the exact placement."
-        )
-        L.append("- Use keyframes (`keyframe_insert`) with the exact times and frames given.")
-        L.append("- Name every object clearly so later segments can reference them.\n")
+        L.append(f"- FPS {fps} | Engine {render_engine} | Units metres, Z-up | Rotations in degrees (Euler XYZ)")
+        if plan.get("visual_theme_notes"):
+            L.append(f"- Theme: {plan['visual_theme_notes']}")
+        L.append("- Use `keyframe_insert` with the exact frames given. Name every object clearly.\n")
 
-        if a.get("project_title"):
-            L.append(f"## Project: {a['project_title']}")
-        if a.get("overall_environment"):
-            L.append(f"Environment: {a['overall_environment']}\n")
+        if plan.get("project_title"):
+            L.append(f"## Project: {plan['project_title']}")
 
-        names = {c.get("name") for c in data.get("characters", [])} if ok else set()
-        present = [c for c in chars if c.get("name") in names] or chars
-        L.append("## Characters in this segment")
-        for c in present:
-            L.append(f"- **{c.get('name', 'Unnamed')}** ({c.get('species_or_type', '')}): {c.get('appearance', '')}")
-            if c.get("outfit_and_accessories"):
-                L.append(f"  - Outfit: {c['outfit_and_accessories']}")
-            if c.get("colors"):
-                L.append(f"  - Colors: {c['colors']}")
-            if c.get("approx_height_m"):
-                L.append(f"  - Approx height: {c['approx_height_m']} m")
+        L.append("## Who is in this segment")
+        for c in seg.get("characters", []):
+            info = cmap.get(c.get("name"), {})
+            if info.get("existing_asset"):
+                L.append(f"- **{c.get('name')}** → my existing asset `{info['existing_asset']}` (do not modify it)")
+            else:
+                desc = info.get("appearance") or ""
+                how = info.get("import_strategy") or "simple stand-in"
+                L.append(f"- **{c.get('name')}** → NOT in my scene. {desc} Obtain via: {how}")
+
+        L.append("\n## Environment")
+        if i == 1:
+            L.append("Build this persistent environment now (match my assets' style):")
+            L.append("```json\n" + json.dumps(env, indent=2, ensure_ascii=False) + "\n```")
+        else:
+            if env_names:
+                L.append("Already built in earlier segments: " + ", ".join(env_names) + ".")
+            for ch in seg.get("environment_changes", []):
+                L.append(f"- Change: {ch}")
 
         L.append(f"\n## Segment {i} spec")
-        if ok:
-            if data.get("summary"):
-                L.append(data["summary"])
-            if data.get("claude_instructions"):
-                L.append(f"\n**Instructions:** {data['claude_instructions']}")
-            L.append("\n```json")
-            L.append(json.dumps(data, indent=2, ensure_ascii=False))
-            L.append("```")
-        else:
-            L.append(data.get("_raw", ""))
+        if seg.get("summary"):
+            L.append(seg["summary"])
+        if seg.get("claude_instructions"):
+            L.append(f"\n**Instructions:** {seg['claude_instructions']}")
+        spec = {k: v for k, v in seg.items() if k not in ("claude_instructions", "summary", "environment_changes")}
+        L.append("\n```json\n" + json.dumps(spec, indent=2, ensure_ascii=False) + "\n```")
 
         L.append("\n## Deliverable")
         L.append(
-            "Generate the bpy script, execute it through the Blender connector, and report what was "
-            "created plus any assumptions or fallbacks. Then stop and wait for the next segment."
+            "Run the script through the connector, then report in a few lines what was created or reused, "
+            "and any assumptions or fallbacks. Then stop and wait for the next segment."
         )
         out.append({"title": title, "text": "\n".join(L)})
 
@@ -352,7 +330,7 @@ def build_segment_prompts():
 # Main UI
 # --------------------------------------------------------------------------- #
 st.title("🎬 Storyboard → Blender Prompts")
-st.caption("Upload your storyboard. Gemini reads it and generates everything else.")
+st.caption("Upload the storyboard, list the assets you already imported, get one prompt per segment.")
 
 story_files = st.file_uploader(
     "1 · Storyboard image(s)",
@@ -362,44 +340,38 @@ story_files = st.file_uploader(
 if story_files:
     st.image([f.getvalue() for f in story_files], width=420)
 
-with st.expander("Optional: extra references and notes"):
-    ref_files = st.file_uploader(
-        "Character / environment reference images",
+asset_text = st.text_area(
+    "2 · Assets already imported in my Blender scene",
+    placeholder="One per line, exact Outliner name, with what it is. Example:\nBobo (boy character, rigged)\nZia (girl character, rigged)\nBus (school bus vehicle)",
+    height=120,
+    help="Claude will use these exactly as they are and match the scene's theme to them.",
+)
+
+with st.expander("Optional: asset screenshots and notes"):
+    asset_files = st.file_uploader(
+        "Screenshots of your imported assets (helps Gemini match the theme)",
         type=["png", "jpg", "jpeg", "webp"],
         accept_multiple_files=True,
-        key="refs",
+        key="assets_img",
     )
-    notes = st.text_area("Extra notes for the model", placeholder="Anything the storyboard doesn't show.")
+    notes = st.text_area("Extra notes", placeholder="Anything the storyboard doesn't show.")
 
 if not ss.api_key:
     st.info("Save your Gemini API key in the sidebar first.")
 
-if st.button("✨ Analyze & generate", type="primary", disabled=not (ss.api_key and story_files)):
+if st.button("✨ Generate (1 Gemini call)", type="primary", disabled=not (ss.api_key and story_files)):
     try:
-        run_pipeline(story_files, ref_files, notes)
+        run_pipeline(story_files, asset_text, asset_files, notes)
     except Exception as e:  # noqa: BLE001
         st.error(f"Generation failed: {e}")
 
-# --------------------------------------------------------------------------- #
-# Output
-# --------------------------------------------------------------------------- #
-if ss.analysis:
-    with st.expander("What Gemini read from the storyboard", expanded=False):
-        st.json(ss.analysis, expanded=1)
-
-if ss.results:
-    with st.expander("Per-segment Blender specs", expanded=False):
-        for i, (seg, data) in enumerate(ss.results, 1):
-            st.markdown(f"**Segment {i}: {seg.get('title', '')}**")
-            if "_raw" in data:
-                st.warning(data["_error"])
-                st.code(data["_raw"])
-            else:
-                st.json(data, expanded=False)
+if ss.plan:
+    with st.expander("What Gemini planned (raw JSON)", expanded=False):
+        st.json(ss.plan, expanded=1)
 
 if ss.segment_prompts:
-    st.subheader("2 · Copy one segment at a time into Claude")
-    st.caption("Each tab is a complete, standalone prompt. Copy Segment 1, paste into Claude, wait for it to finish, then do Segment 2.")
+    st.subheader("3 · Copy one segment at a time into Claude")
+    st.caption("Each tab is a standalone prompt. Copy Segment 1, paste into Claude, wait for it to finish, then do Segment 2.")
     tabs = st.tabs([f"{i}. {p['title']}" for i, p in enumerate(ss.segment_prompts, 1)])
     for i, (tab, p) in enumerate(zip(tabs, ss.segment_prompts), 1):
         with tab:
