@@ -247,8 +247,8 @@ These objects are ALREADY imported and finished. Treat their design as final:
   edit meshes / rigs / shape keys, change origins, or change scale or dimensions.
 - Only change object-level location and rotation (and use existing pose bones / shape keys / actions if
   they exist). Never apply or bake transforms in a way that alters the mesh.
-- Before building, inspect the scene ONCE (names, types, dimensions, bounding boxes, forward axis,
-  armature bones, shape keys, materials). Use the REAL measured sizes, not guesses. Put each asset's lowest
+- Before building, inspect the scene ONCE and COMPACTLY (see Tool output limits): dimensions, lowest point,
+  forward axis, and face-related controls of my listed assets only. Use the REAL measured sizes, not guesses. Put each asset's lowest
   point on the ground, face it correctly, and treat the coordinates in the spec as layout targets that you
   adjust to the real sizes while keeping the same distances, facing and framing.
 - THEME: anything new you add (props, effects, and an environment ONLY if I did not provide one) must match
@@ -265,8 +265,8 @@ My asset list:
 FACE_RULES = """## Facial expressions and performance (required)
 Animate every on-screen character's face so it matches the scene. Use the `expressions` timeline in the spec
 (emotion, intensity 0 to 1, eyes, brows, mouth) as the performance plan.
-- In your single scene inspection, also list each character's facial controls: shape keys on the face/head/eye
-  meshes, face or jaw or eye or brow bones, custom properties, and drivers. Match the spec's emotions to the
+- In your single scene inspection, also list each character's face-related controls only (filtered names, see
+  Tool output limits): shape keys, face / jaw / eye / brow bones, custom properties, drivers. Match the spec's emotions to the
   CLOSEST controls that already exist (smile, brow raise, eyes wide, blink, jaw open, mouth shapes, eye look).
 - Animate only VALUES with keyframes (shape key values, bone rotations, custom property values). Never create,
   rename, edit or delete shape keys, bones, drivers or materials on my assets.
@@ -285,6 +285,19 @@ ENV_PROVIDED = """My environment is already in the Blender scene: {env}
 - Allowed: place characters, vehicles and the camera inside it (inspect it once to find ground level, paths
   and usable spots), and add only small temporary props or effects the action strictly needs, in the same style.
 - Keep its existing lighting and world. Change them only if the shot is unreadable, and as little as possible."""
+
+
+OUTPUT_LIMITS = """## Tool output limits (important)
+Tool results over 1 MB fail, so keep EVERY result small:
+- Never dump the whole scene, mesh data, vertices, node trees, or full bone / shape-key lists.
+- Inspect ONLY the objects named above (match by name). Print one compact line per object:
+  name, type, dimensions, lowest Z, rotation. Nothing else per object.
+- For facial controls, print only names that look face-related (smile, blink, brow, eye, jaw, mouth, cheek,
+  tongue, lip, viseme), at most 60 names per character. For materials print names only.
+- Make every script print at most about 100 lines or 20 KB. If there is more, summarise it with counts.
+- Viewport screenshot: at most one, small (max 800 px wide).
+- Do not read keyframes back to verify. Confirm with counts (for example, keyframes inserted per object).
+"""
 
 
 def vec_safe(d, key, default):
@@ -314,8 +327,8 @@ def build_segment_prompts():
         L = [f"# TASK: Build Segment {i} of {n}: {title} ({s_s}s to {e_s}s)\n"]
         L.append(
             "Use the Blender MCP connector to build THIS segment only. Keep tool calls minimal: "
-            "one scene inspection, then ONE bpy script that builds and keyframes everything, "
-            "then one quick check.\n"
+            "one COMPACT scene inspection, then ONE bpy script that builds and keyframes everything, "
+            "then one quick check. Keep every tool result small (limits below).\n"
         )
 
         L.append("## Scene state")
@@ -339,6 +352,7 @@ def build_segment_prompts():
             L.append(ASSET_RULES.format(assets=assets))
 
         L.append(FACE_RULES)
+        L.append(OUTPUT_LIMITS)
 
         L.append("## Requirements")
         L.append(f"- FPS {fps} | Engine {render_engine} | Units metres, Z-up | Rotations in degrees (Euler XYZ)")
