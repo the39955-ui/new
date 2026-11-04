@@ -108,6 +108,16 @@ EXISTING ASSETS (most important)
 - For things with no existing asset, give a short appearance and an import_strategy
   (Sketchfab / Poly Haven / Hyper3D / primitive stand-in).
 
+FACIAL PERFORMANCE (required for every character that appears on screen)
+- Analyse each segment's mood, action and caption, then give each character an "emotion_arc" and an
+  "expressions" timeline that fits the scene (e.g. surprise, laughter, delight, cheeky, sleepy, scared).
+- Each expression entry: time_s, frame, emotion, intensity (0 to 1), and short details for eyes, brows
+  and mouth. Include eye direction (what the character looks at), blinks, and mouth motion for talking,
+  singing, laughing, chewing, licking or sneezing. Use 2 to 6 entries per character per segment.
+- Expressions must start a few frames BEFORE the action they react to (anticipation) and hold after it.
+- These are performance targets only. Never redesign a character's face. For existing assets, the facial
+  animation must use whatever controls the asset already has (shape keys, face bones, custom properties).
+
 SPEC RULES
 - Blender: right-handed, Z-up, metres, degrees (Euler XYZ), camera looks down local -Z.
 - Coordinates are layout targets; the real asset sizes are unknown to you, so keep relationships
@@ -129,7 +139,7 @@ SCHEMA = """{
     "time_range": {"start_s": number, "end_s": number, "start_frame": int, "end_frame": int},
     "summary": str,
     "environment_changes": [str],
-    "characters": [{"name": str, "placement": {"location": [x,y,z], "rotation_deg": [x,y,z]}, "pose_note": str}],
+    "characters": [{"name": str, "placement": {"location": [x,y,z], "rotation_deg": [x,y,z]}, "pose_note": str, "emotion_arc": str, "expressions": [{"time_s": number, "frame": int, "emotion": str, "intensity": number, "eyes": str, "brows": str, "mouth": str}]}],
     "camera": {"shot_type": str, "location": [x,y,z], "rotation_deg": [x,y,z], "focal_length_mm": number, "dof": {"enabled": bool, "focus_target": str, "f_stop": number}, "movement": str},
     "animation": [{"target": str, "action": str, "keyframes": [{"time_s": number, "frame": int, "property": str, "value": str}], "easing": str}],
     "claude_instructions": str,
@@ -228,6 +238,24 @@ My asset list:
 """
 
 
+
+FACE_RULES = """## Facial expressions and performance (required)
+Animate every on-screen character's face so it matches the scene. Use the `expressions` timeline in the spec
+(emotion, intensity 0 to 1, eyes, brows, mouth) as the performance plan.
+- In your single scene inspection, also list each character's facial controls: shape keys on the face/head/eye
+  meshes, face or jaw or eye or brow bones, custom properties, and drivers. Match the spec's emotions to the
+  CLOSEST controls that already exist (smile, brow raise, eyes wide, blink, jaw open, mouth shapes, eye look).
+- Animate only VALUES with keyframes (shape key values, bone rotations, custom property values). Never create,
+  rename, edit or delete shape keys, bones, drivers or materials on my assets.
+- Start each expression 3 to 6 frames before the action it reacts to, ease in, hold, then settle back to neutral.
+- Add natural life: a blink every 3 to 5 seconds, eyes looking at the thing they react to, small head
+  tilts, and mouth motion for talking, singing, laughing, chewing, licking or sneezing (oscillate the jaw or
+  mouth shapes if there are no speech shapes).
+- If a character has no facial controls at all, animate head and eye bones or object-level head motion only,
+  and tell me exactly what was missing.
+- In your report, list per character which controls you used for expressions.
+"""
+
 def vec_safe(d, key, default):
     v = d.get(key)
     return v if v is not None else default
@@ -278,6 +306,8 @@ def build_segment_prompts():
         if assets:
             L.append(ASSET_RULES.format(assets=assets))
 
+        L.append(FACE_RULES)
+
         L.append("## Requirements")
         L.append(f"- FPS {fps} | Engine {render_engine} | Units metres, Z-up | Rotations in degrees (Euler XYZ)")
         if plan.get("visual_theme_notes"):
@@ -318,7 +348,8 @@ def build_segment_prompts():
         L.append("\n## Deliverable")
         L.append(
             "Run the script through the connector, then report in a few lines what was created or reused, "
-            "and any assumptions or fallbacks. Then stop and wait for the next segment."
+            "which facial controls drove each character's expressions, and any assumptions or fallbacks. "
+            "Then stop and wait for the next segment."
         )
         out.append({"title": title, "text": "\n".join(L)})
 
